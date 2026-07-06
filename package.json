@@ -1,0 +1,15 @@
+{
+  "name": "@devclocked/claude-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "devclocked-claude-hooks": "./install.js"
+  },
+  "scripts": {
+    "doctor": "node install.js doctor",
+    "install-hooks": "node install.js install",
+    "test": "node --test hooks/runtime.test.js hooks/ship.test.js hooks/track.test.js install.test.js",
+    "uninstall-hooks": "node uninstall.js"
+  }
+}
