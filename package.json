@@ -9,7 +9,7 @@
   "scripts": {
     "doctor": "node install.js doctor",
     "install-hooks": "node install.js install",
-    "test": "node --test hooks/runtime.test.js hooks/ship.test.js hooks/track.test.js install.test.js",
+    "test": "node --test runtime/core.test.js hooks/runtime.test.js hooks/ship.test.js hooks/track.test.js install.test.js",
     "uninstall-hooks": "node uninstall.js"
   }
 }

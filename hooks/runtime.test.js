@@ -16,6 +16,7 @@ const {
   rememberSessionModel,
   resolveExecutionContext,
   resolveModel,
+  resolveRepo,
   resolveStream,
   saveStreamState,
   sessionModel,
@@ -266,6 +267,46 @@ test('workspace_fingerprint rides on the request when known', () => {
     { ...NO_GIT, workspaceFingerprint: 'abc123' }
   );
   assert.equal(payload.workspace_fingerprint, 'abc123');
+});
+
+test('workspace_path rides on the request when the workspace resolved', () => {
+  const payload = buildTrackTickRequest(
+    'SessionStart',
+    { session_id: 'sess-13' },
+    primaryStream('sess-13'),
+    REPO,
+    { ...NO_GIT, workspacePath: '/users/dev/projects/example' }
+  );
+  assert.equal(payload.workspace_path, '/users/dev/projects/example');
+});
+
+test('deferred resolution ships no workspace_path and no fingerprint', () => {
+  const payload = buildTrackTickRequest(
+    'SessionStart',
+    { session_id: 'sess-14' },
+    primaryStream('sess-14'),
+    { branch: null, repo_name: null },
+    { ...NO_GIT, workspacePath: null, resolution: 'deferred' }
+  );
+  assert.equal(payload.workspace_path, undefined);
+  assert.equal(payload.workspace_fingerprint, undefined);
+  assert.equal(payload.ticks[0].project_name, undefined);
+});
+
+test('resolveRepo mirrors the git context and never basename-guesses on deferral', () => {
+  const named = resolveRepo(
+    { cwd: '/users/dev/projects/example/sub' },
+    primaryStream('sess-15'),
+    { resolution: 'git', repoName: 'example', branch: 'main' }
+  );
+  assert.deepEqual(named, { branch: 'main', repo_name: 'example' });
+
+  const deferred = resolveRepo(
+    { cwd: '/users/dev/projects/example/sub' },
+    primaryStream('sess-15'),
+    { resolution: 'deferred', repoName: null, branch: null }
+  );
+  assert.deepEqual(deferred, { branch: null, repo_name: null });
 });
 
 test('isTrackTickProcessed rejects accepted but unprocessed responses', () => {

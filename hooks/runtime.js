@@ -84,22 +84,15 @@ function resolveStream(hookEvent, input) {
   };
 }
 
+// Naming is decided entirely by the identity ladder in resolveGitContext —
+// a deferred resolution must ship the tick with NO project name rather than
+// fall back to a basename guess (DEV-674).
 function resolveRepo(input, stream, gitContext) {
-  if (gitContext.repoName || gitContext.branch) {
-    return {
-      branch: gitContext.branch || null,
-      repo_name: gitContext.repoName || null,
-    };
-  }
-
-  if (input.cwd) {
-    return {
-      branch: null,
-      repo_name: path.basename(input.cwd),
-    };
-  }
-
-  return { branch: null, repo_name: 'unknown' };
+  if (gitContext.resolution === 'deferred') return { branch: null, repo_name: null };
+  return {
+    branch: gitContext.branch || null,
+    repo_name: gitContext.repoName || null,
+  };
 }
 
 // Model is only present on SessionStart input; persist it on the session's
@@ -245,6 +238,13 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   const request = { ticks: [tick] };
   if (gitContext.workspaceFingerprint) {
     request.workspace_fingerprint = gitContext.workspaceFingerprint;
+  }
+  // Absolute path of the resolved workspace root (git root, or session cwd
+  // for non-git projects), sent alongside the one-way fingerprint hash so the
+  // backend can do directory-containment checks even when naming is deferred
+  // (DEV-551 contract, same field the daemon and cursor-plugin send).
+  if (gitContext.workspacePath) {
+    request.workspace_path = gitContext.workspacePath;
   }
   return request;
 }
