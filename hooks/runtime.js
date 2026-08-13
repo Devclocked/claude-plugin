@@ -218,6 +218,9 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
         model_provider: modelProvider || undefined,
         session_file_id: sessionFileId,
         agent_id: stream.isSubagent ? stream.agentId : undefined,
+        // Registry type name ('Explore', 'general-purpose') — only SubagentStart
+        // carries it, and one tick is enough for the stream to be named (DEV-816).
+        agent_type: stream.agentType || undefined,
         is_sidechain: stream.isSubagent,
         stream_id: streamId,
         parent_stream_id: stream.isSubagent ? rootStreamId : undefined,

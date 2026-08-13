@@ -161,6 +161,7 @@ test('subagent events carry agent_id and sidechain stream identity', () => {
   const aiTool = payload.ticks[0].activity_context.ai_tool;
   assert.equal(payload.ticks[0].entity, 'claude://agent/Explore/agent-2');
   assert.equal(aiTool.agent_id, 'agent-2');
+  assert.equal(aiTool.agent_type, 'Explore');
   assert.equal(aiTool.is_sidechain, true);
   assert.equal(aiTool.stream_id, 'claude-code:sess-6:agent-2');
   assert.equal(aiTool.parent_stream_id, 'claude-code:sess-6');
