@@ -253,6 +253,11 @@ test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', (
     command: 'aws s3 cp secret.txt s3://bucket --key AKIASECRET',
     prompt: 'my private prompt with confidential business plans',
     edits: [{ old_string: 'a\nb\nc', new_string: 'a\nb\nc\nd\ne' }],
+    devclocked_capture: {
+      remote: true,
+      captured_at: '2026-08-14T07:00:00.000Z',
+      bridge_session_id: 'bridge-7',
+    },
   });
 
   const raw = fs.readFileSync(filePath, 'utf-8');
@@ -267,6 +272,12 @@ test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', (
   assert.equal(envelope.input.file_path, '/tmp/project/src/app.ts');
   assert.equal(envelope.input.tool_input.file_path, '/tmp/project/src/app.ts');
   assert.equal(envelope.input.command, 'aws');
+  // Every devclocked_capture leaf is consumed downstream and none can be
+  // re-derived once the detached shipper picks the envelope up: captured_at is
+  // the tick timestamp, bridge_session_id the Remote Control attribution.
+  assert.equal(envelope.input.devclocked_capture.remote, true);
+  assert.equal(envelope.input.devclocked_capture.captured_at, '2026-08-14T07:00:00.000Z');
+  assert.equal(envelope.input.devclocked_capture.bridge_session_id, 'bridge-7');
   // Edit line counts are preserved for countEditLines (old=3 lines, new=5 lines).
   assert.equal(envelope.input.edits[0].old_string.split('\n').length, 3);
   assert.equal(envelope.input.edits[0].new_string.split('\n').length, 5);
