@@ -242,6 +242,36 @@ test('repo_url with embedded credentials is stripped before it reaches context',
   assert.equal(context.repoFullName, 'acme/secretrepo');
 });
 
+test('devclocked_capture scalar leaves survive the sanitizer by type, not by key list (DEV-817)', () => {
+  const runtime = makeRuntime(() => '');
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'afterFileEdit',
+    session_id: 'sess-817',
+    devclocked_capture: {
+      remote: true,
+      captured_at: '2026-08-14T07:00:00.000Z',
+      bridge_session_id: 'bridge-7',
+      // A capture key that does not exist yet — the truncation class this fix
+      // removes is "new key silently dropped by a stale copy".
+      future_key: 'future-value',
+      future_count: 3,
+      future_flag: null,
+      // Nested content is not part of our scalar envelope and stays out.
+      nested: { secret: 'must-not-persist' },
+    },
+  });
+
+  const envelope = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  assert.deepEqual(envelope.input.devclocked_capture, {
+    remote: true,
+    captured_at: '2026-08-14T07:00:00.000Z',
+    bridge_session_id: 'bridge-7',
+    future_key: 'future-value',
+    future_count: 3,
+    future_flag: null,
+  });
+});
+
 test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', () => {
   const runtime = makeRuntime(() => '');
   const filePath = runtime.enqueueHookEvent({
