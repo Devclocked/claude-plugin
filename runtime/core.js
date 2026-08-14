@@ -141,7 +141,13 @@ function sanitizeHookInput(input) {
     clean.tool_input = { file_path: input.tool_input.file_path };
   }
   if (input.devclocked_capture && typeof input.devclocked_capture === 'object') {
-    clean.devclocked_capture = { remote: input.devclocked_capture.remote };
+    clean.devclocked_capture = {
+      remote: input.devclocked_capture.remote,
+      // Hook-time clock and bridge id: the shipper runs detached and possibly
+      // much later, so neither can be re-derived once this envelope is on disk.
+      captured_at: input.devclocked_capture.captured_at,
+      bridge_session_id: input.devclocked_capture.bridge_session_id,
+    };
   }
   if (Array.isArray(input.workspace_roots)) {
     clean.workspace_roots = input.workspace_roots.filter((r) => typeof r === 'string');
