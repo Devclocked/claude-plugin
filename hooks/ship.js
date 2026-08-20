@@ -10,6 +10,7 @@ const {
   buildTrackTickRequest,
   callEdgeFunction,
   classifyActivity,
+  deadLetterEnvelope,
   discardEnvelope,
   getStreamState,
   markEnvelopeRetry,
@@ -147,10 +148,20 @@ async function processEnvelope(filePath, apiKey) {
     }
 
     fs.unlinkSync(filePath);
+    // Truthy tells drainQueue the backend is reachable, which is what unlocks
+    // the one dead-letter replay pass for this shipper run (DEV-936).
+    return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown_error';
     if ((envelope.attempts || 0) + 1 >= MAX_SHIP_ATTEMPTS) {
-      discardEnvelope(filePath, envelope, `max_attempts:${message}`);
+      // Retries exhausted. This used to unlink the envelope, so ~75s of backend
+      // downtime destroyed the activity for good. Park it in the bounded
+      // dead-letter store instead and let the next reachable run replay it —
+      // ingest is idempotent, so a late replay cannot double-count (DEV-936).
+      envelope.attempts = (envelope.attempts || 0) + 1;
+      envelope.last_error = message;
+      envelope.last_attempt_at = new Date().toISOString();
+      deadLetterEnvelope(filePath, envelope, `max_attempts:${message}`);
       return;
     }
     markEnvelopeRetry(filePath, envelope, message);

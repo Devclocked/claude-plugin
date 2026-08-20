@@ -29,21 +29,53 @@ async function acquireShipperLockWithWait(runtime, { timeoutMs = 5000, intervalM
 // Stops when the re-list is empty, when it contains nothing we have not already
 // attempted in this run (a file that refuses to be removed must not spin the
 // loop), or at maxPasses.
-async function drainQueue(runtime, processEnvelope, { maxPasses = 25, apiKey = runtime.loadAuth() } = {}) {
+//
+// DEV-936: once the live queue is drained, the run makes at most ONE dead-letter
+// replay pass — when something shipped (the backend is demonstrably reachable)
+// or when the live queue was empty to begin with (an idle run doubles as a
+// reconnect probe). Replayed envelopes drain in the same run; a backend that is
+// still down fails them once and the run ends, so it cannot spin the shipper.
+//
+// processEnvelope resolves truthy when the envelope actually shipped; every
+// other outcome (retry, discard, dead-letter) resolves falsy.
+async function drainQueue(runtime, processEnvelope, { maxPasses = 25, apiKey = runtime.loadAuth(), replay = true } = {}) {
   const attempted = new Set();
   let passes = 0;
+  let shipped = 0;
+  let replayed = 0;
+  let replayDone = false;
   let files = runtime.listQueueFiles();
 
-  while (files.length > 0 && passes < maxPasses) {
-    passes += 1;
-    for (const filePath of files) {
-      attempted.add(filePath);
-      await processEnvelope(filePath, apiKey);
+  for (;;) {
+    while (files.length > 0 && passes < maxPasses) {
+      passes += 1;
+      for (const filePath of files) {
+        attempted.add(filePath);
+        if (await processEnvelope(filePath, apiKey)) shipped += 1;
+      }
+      files = runtime.listQueueFiles().filter((filePath) => !attempted.has(filePath));
     }
+
+    if (replayDone || !replay || passes >= maxPasses) break;
+    if (typeof runtime.replayDeadLetter !== 'function') break;
+    // Set before replaying, not after: one pass per run whatever happens next.
+    replayDone = true;
+
+    // Prune first so entries past the age/byte ceiling are evicted rather than
+    // replayed.
+    if (typeof runtime.pruneDeadLetter === 'function') runtime.pruneDeadLetter();
+
+    // Nothing shipped and the queue was not empty: the backend is still
+    // unreachable, so replaying now would only burn the replayed items' first
+    // attempt for nothing.
+    if (shipped === 0 && attempted.size > 0) break;
+
+    replayed = runtime.replayDeadLetter();
+    if (replayed === 0) break;
     files = runtime.listQueueFiles().filter((filePath) => !attempted.has(filePath));
   }
 
-  return { passes, attempted: attempted.size };
+  return { passes, attempted: attempted.size, shipped, replayed };
 }
 
 async function runShipper(runtime, processEnvelope) {
@@ -62,7 +94,13 @@ async function runShipper(runtime, processEnvelope) {
       process.exit(0);
     }
 
-    await drainQueue(runtime, processEnvelope, { apiKey });
+    const result = await drainQueue(runtime, processEnvelope, { apiKey });
+    if (result.replayed > 0) {
+      runtime.appendLog('shipper', 'Dead-letter replay pass completed', {
+        replayed: result.replayed,
+        shipped: result.shipped,
+      });
+    }
 
     if (typeof runtime.pruneStaleStreamState === 'function') {
       const pruned = runtime.pruneStaleStreamState();

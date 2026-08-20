@@ -13,6 +13,14 @@ const LOCK_STALE_MS = 60_000;
 const GIT_CACHE_TTL_MS = 60_000;
 const MAX_SHIP_ATTEMPTS = 5;
 const RETRY_BACKOFF_MS = 15_000;
+// Exhausting MAX_SHIP_ATTEMPTS used to unlink the envelope, so ~75s of backend
+// downtime destroyed the activity permanently. Exhausted envelopes now move to
+// a bounded on-disk dead-letter store and replay once sends succeed again
+// (DEV-936, design ported from tracker-core DEV-826). Backend ingest is
+// idempotent (tick_key + request_key), so replaying a stale backlog is safe
+// with no client-side dedupe. Eviction below is the only path that loses data.
+const DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEAD_LETTER_MAX_BYTES = 5 * 1024 * 1024;
 const PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1000;
 const MAX_PLUGIN_ACTIVITY_ENTRIES = 1000;
 const STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -210,6 +218,10 @@ function createPluginRuntime(options) {
   const QUEUE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-queue`);
   const LOG_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-logs`);
   const GIT_CACHE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-cache`);
+  // Sibling of QUEUE_DIR, never inside it: listQueueFiles() globs every *.json
+  // in QUEUE_DIR, so a dead-letter entry parked there would be picked straight
+  // back up by the next drain instead of waiting for a replay.
+  const DEAD_LETTER_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-dead-letter`);
   const SHIPPER_LOCK_PATH = path.join(QUEUE_DIR, 'shipper.lock');
   const PLUGIN_ACTIVITY_PATH = path.join(PLUGIN_ACTIVITY_DIR, `${source}.json`);
 
@@ -696,6 +708,10 @@ function createPluginRuntime(options) {
     return Date.now() >= new Date(envelope.retry_after).getTime();
   }
 
+  // Intentional drops only — a missing hook event name, a session end the
+  // backend already closed, a throttled tick, a tick the backend processed as
+  // no-op. Retry exhaustion is NOT one of these; it goes to the dead-letter
+  // store below (DEV-936).
   function discardEnvelope(filePath, envelope, reason) {
     appendLog('shipper', 'Dropping queued hook event', {
       file: path.basename(filePath),
@@ -708,6 +724,145 @@ function createPluginRuntime(options) {
     } catch {
       // ignore
     }
+  }
+
+  function listDeadLetterFiles() {
+    try {
+      ensureDir(DEAD_LETTER_DIR);
+      return fs
+        .readdirSync(DEAD_LETTER_DIR)
+        .filter((name) => name.endsWith('.json'))
+        .sort()
+        .map((name) => path.join(DEAD_LETTER_DIR, name));
+    } catch {
+      return [];
+    }
+  }
+
+  // Park an envelope whose retries are exhausted. Write-then-remove so a crash
+  // between the two can only duplicate, never lose — and duplicates are
+  // absorbed by the idempotent backend ingest. Returns the new path, or null
+  // when the move failed (the envelope then stays queued and retries again).
+  function deadLetterEnvelope(filePath, envelope, reason) {
+    const target = path.join(DEAD_LETTER_DIR, path.basename(filePath));
+    envelope.dead_lettered_at = new Date().toISOString();
+    envelope.dead_letter_reason = reason;
+    try {
+      writeJsonFile(target, envelope);
+      fs.unlinkSync(filePath);
+    } catch (error) {
+      appendLog('shipper', 'Failed to dead-letter queued hook event', {
+        file: path.basename(filePath),
+        reason,
+        error: error instanceof Error ? error.message : 'unknown_error',
+      });
+      return null;
+    }
+    appendLog('shipper', 'Dead-lettered queued hook event, will replay on reconnect', {
+      file: path.basename(filePath),
+      reason,
+      hook_event_name: envelope.input?.hook_event_name || null,
+      attempts: envelope.attempts || 0,
+    });
+    pruneDeadLetter();
+    return target;
+  }
+
+  // Bound the dead-letter store by age and by total bytes, oldest first. This
+  // is the only place queued activity is truly lost, so every eviction is
+  // logged — silent loss here would be the exact bug DEV-936 fixes.
+  function pruneDeadLetter(now = Date.now(), options = {}) {
+    const maxAgeMs = options.maxAgeMs ?? DEAD_LETTER_MAX_AGE_MS;
+    const maxBytes = options.maxBytes ?? DEAD_LETTER_MAX_BYTES;
+
+    const entries = [];
+    for (const filePath of listDeadLetterFiles()) {
+      let stats;
+      try {
+        stats = fs.statSync(filePath);
+      } catch {
+        continue;
+      }
+      let capturedAtMs = NaN;
+      try {
+        capturedAtMs = Date.parse(readJsonFile(filePath).captured_at);
+      } catch {
+        // Unreadable envelope: fall back to mtime so it can still age out.
+      }
+      if (!Number.isFinite(capturedAtMs)) capturedAtMs = stats.mtimeMs;
+      entries.push({ filePath, bytes: stats.size, capturedAtMs });
+    }
+
+    let evicted = 0;
+    const evict = (entry, reason, detail) => {
+      try {
+        fs.unlinkSync(entry.filePath);
+      } catch {
+        return false;
+      }
+      evicted += 1;
+      appendLog('shipper', 'Evicted dead-lettered hook event — activity permanently lost', {
+        file: path.basename(entry.filePath),
+        reason,
+        captured_at: new Date(entry.capturedAtMs).toISOString(),
+        bytes: entry.bytes,
+        ...detail,
+      });
+      return true;
+    };
+
+    const survivors = [];
+    for (const entry of entries) {
+      if (now - entry.capturedAtMs > maxAgeMs) {
+        if (!evict(entry, 'max_age', { max_age_ms: maxAgeMs })) survivors.push(entry);
+        continue;
+      }
+      survivors.push(entry);
+    }
+
+    survivors.sort((a, b) => a.capturedAtMs - b.capturedAtMs);
+    let totalBytes = survivors.reduce((sum, entry) => sum + entry.bytes, 0);
+    for (const entry of survivors) {
+      if (totalBytes <= maxBytes) break;
+      if (evict(entry, 'max_bytes', { max_bytes: maxBytes, total_bytes: totalBytes })) {
+        totalBytes -= entry.bytes;
+      }
+    }
+
+    return evicted;
+  }
+
+  // Move every dead-lettered envelope back into the live queue with a clean
+  // retry budget. Callers run this at most once per shipper pass so a still
+  // unreachable backend cannot spin the shipper; envelopes that fail again
+  // retry and re-dead-letter through the normal path.
+  function replayDeadLetter() {
+    let replayed = 0;
+    for (const filePath of listDeadLetterFiles()) {
+      let envelope;
+      try {
+        envelope = readJsonFile(filePath);
+      } catch {
+        continue;
+      }
+      envelope.attempts = 0;
+      delete envelope.retry_after;
+      envelope.replayed_at = new Date().toISOString();
+      try {
+        writeJsonFile(path.join(QUEUE_DIR, path.basename(filePath)), envelope);
+        fs.unlinkSync(filePath);
+        replayed += 1;
+      } catch (error) {
+        appendLog('shipper', 'Failed to replay dead-lettered hook event', {
+          file: path.basename(filePath),
+          error: error instanceof Error ? error.message : 'unknown_error',
+        });
+      }
+    }
+    if (replayed > 0) {
+      appendLog('shipper', 'Replayed dead-lettered hook events into the queue', { count: replayed });
+    }
+    return replayed;
   }
 
   function wakeShipper() {
@@ -789,28 +944,35 @@ function createPluginRuntime(options) {
     QUEUE_DIR,
     LOG_DIR,
     GIT_CACHE_DIR,
+    DEAD_LETTER_DIR,
     SHIPPER_LOCK_PATH,
     SHIPPER_PATH: shipperPath,
     MAX_SHIP_ATTEMPTS,
+    DEAD_LETTER_MAX_AGE_MS,
+    DEAD_LETTER_MAX_BYTES,
     appendLog,
     acquireShipperLock,
     callEdgeFunction,
     classifyGitFailure,
+    deadLetterEnvelope,
     discardEnvelope,
     enqueueHookEvent,
     ensureDir,
     firstOpaqueId,
     getStreamState,
     isTrackTickProcessed,
+    listDeadLetterFiles,
     listQueueFiles,
     loadAuth,
     markEnvelopeRetry,
     normalizeOpaqueId,
+    pruneDeadLetter,
     pruneStaleStreamState,
     readJsonFile,
     recordPluginActivity,
     releaseShipperLock,
     removeStreamState,
+    replayDeadLetter,
     resolveGitContext,
     saveStreamState,
     shouldRetryEnvelope,
@@ -823,5 +985,7 @@ function createPluginRuntime(options) {
 
 module.exports = {
   MAX_SHIP_ATTEMPTS,
+  DEAD_LETTER_MAX_AGE_MS,
+  DEAD_LETTER_MAX_BYTES,
   createPluginRuntime,
 };

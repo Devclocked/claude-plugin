@@ -348,3 +348,141 @@ test('acquireShipperLock reclaims an empty lock file whose mtime is older than L
   runtime.releaseShipperLock(fd);
   assert.equal(fs.existsSync(runtime.SHIPPER_LOCK_PATH), false);
 });
+
+// --- DEV-936: dead-letter store instead of dropping exhausted envelopes ------
+// Design ported from tracker-core DEV-826. Every runtime in this file shares one
+// namespace, so each test starts from an empty dead-letter dir.
+
+function clearDeadLetter(runtime) {
+  for (const filePath of runtime.listDeadLetterFiles()) fs.unlinkSync(filePath);
+}
+
+function writeDeadLetterEntry(runtime, name, ageMs, padBytes = 0) {
+  fs.mkdirSync(runtime.DEAD_LETTER_DIR, { recursive: true });
+  const filePath = path.join(runtime.DEAD_LETTER_DIR, name);
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      id: name,
+      captured_at: new Date(Date.now() - ageMs).toISOString(),
+      attempts: 5,
+      dead_lettered_at: new Date().toISOString(),
+      dead_letter_reason: 'max_attempts:edge_function_503',
+      input: { hook_event_name: 'PostToolUse', session_id: name, pad: 'x'.repeat(padBytes) },
+    })
+  );
+  return filePath;
+}
+
+test('an exhausted envelope moves into the dead-letter dir instead of being unlinked (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'PostToolUse',
+    session_id: 'sess-936-move',
+  });
+  const envelope = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+  const parked = runtime.deadLetterEnvelope(filePath, envelope, 'max_attempts:edge_function_503');
+
+  assert.equal(parked, path.join(runtime.DEAD_LETTER_DIR, path.basename(filePath)));
+  assert.equal(fs.existsSync(filePath), false, 'the envelope must leave the live queue');
+  assert.equal(fs.existsSync(parked), true, 'the envelope must survive on disk');
+
+  const stored = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  assert.ok(stored.dead_lettered_at, 'dead_lettered_at must be stamped');
+  assert.equal(stored.dead_letter_reason, 'max_attempts:edge_function_503');
+  assert.deepEqual(stored.input, envelope.input, 'the payload must survive untouched');
+
+  // The dead-letter dir is a sibling of the queue dir, so the live drain keeps
+  // ignoring parked envelopes until a replay puts them back.
+  assert.deepEqual(runtime.listDeadLetterFiles(), [parked]);
+  assert.ok(runtime.listQueueFiles().every((queued) => !queued.startsWith(runtime.DEAD_LETTER_DIR)));
+
+  clearDeadLetter(runtime);
+});
+
+test('dead-letter pruning evicts entries past the 7-day age cap and keeps younger ones (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  assert.equal(runtime.DEAD_LETTER_MAX_AGE_MS, 7 * 24 * 60 * 60 * 1000);
+
+  const eightDaysOld = writeDeadLetterEntry(runtime, 'aged-out.json', 8 * 24 * 60 * 60 * 1000);
+  const sixDaysOld = writeDeadLetterEntry(runtime, 'still-young.json', 6 * 24 * 60 * 60 * 1000);
+
+  assert.equal(runtime.pruneDeadLetter(), 1);
+  assert.equal(fs.existsSync(eightDaysOld), false);
+  assert.equal(fs.existsSync(sixDaysOld), true);
+
+  clearDeadLetter(runtime);
+});
+
+test('dead-letter pruning evicts oldest-first until the byte ceiling is met (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  assert.equal(runtime.DEAD_LETTER_MAX_BYTES, 5 * 1024 * 1024);
+
+  const oldest = writeDeadLetterEntry(runtime, 'a-oldest.json', 30 * 60_000, 3000);
+  const middle = writeDeadLetterEntry(runtime, 'b-middle.json', 20 * 60_000, 3000);
+  const newest = writeDeadLetterEntry(runtime, 'c-newest.json', 10 * 60_000, 3000);
+
+  // A ceiling only the newest entry fits under: the two older ones must go, in
+  // age order, and eviction must stop as soon as the store is under the cap.
+  const maxBytes = fs.statSync(newest).size;
+  assert.equal(runtime.pruneDeadLetter(Date.now(), { maxBytes }), 2);
+
+  assert.equal(fs.existsSync(oldest), false);
+  assert.equal(fs.existsSync(middle), false);
+  assert.equal(fs.existsSync(newest), true, 'the newest entry must survive');
+
+  clearDeadLetter(runtime);
+});
+
+test('every dead-letter eviction is logged — the only path that loses activity is never silent (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const logPath = path.join(runtime.LOG_DIR, 'shipper.log');
+  const before = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8').length : 0;
+
+  writeDeadLetterEntry(runtime, 'loud-eviction.json', 9 * 24 * 60 * 60 * 1000);
+  assert.equal(runtime.pruneDeadLetter(), 1);
+
+  const written = fs.readFileSync(logPath, 'utf-8').slice(before);
+  const entry = written
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((line) => line.extra?.file === 'loud-eviction.json');
+  assert.ok(entry, 'expected an eviction log entry');
+  assert.match(entry.message, /Evicted dead-lettered hook event/);
+  assert.equal(entry.extra.reason, 'max_age');
+
+  clearDeadLetter(runtime);
+});
+
+test('replayDeadLetter returns envelopes to the queue with a clean retry budget (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const parked = writeDeadLetterEntry(runtime, 'replay-me.json', 60_000);
+  const spent = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  spent.retry_after = new Date(Date.now() + 15_000).toISOString();
+  fs.writeFileSync(parked, JSON.stringify(spent));
+
+  assert.equal(runtime.replayDeadLetter(), 1);
+
+  const requeued = path.join(runtime.QUEUE_DIR, 'replay-me.json');
+  assert.equal(fs.existsSync(parked), false);
+  assert.equal(fs.existsSync(requeued), true);
+
+  const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
+  assert.equal(envelope.attempts, 0, 'attempts must reset');
+  assert.equal(envelope.retry_after, undefined, 'the backoff must be cleared');
+  assert.equal(
+    runtime.shouldRetryEnvelope(envelope),
+    true,
+    'a replayed envelope must be immediately eligible'
+  );
+
+  fs.unlinkSync(requeued);
+  clearDeadLetter(runtime);
+});

@@ -47,6 +47,10 @@ function newestFile(dirPath, names) {
 function buildStatus(runtime) {
   const queueFiles = safeList(runtime.QUEUE_DIR, (name) => name.endsWith('.json'));
   const oldest = queueFiles[0] ? fileStats(path.join(runtime.QUEUE_DIR, queueFiles[0])) : null;
+  const deadLetterFiles = safeList(runtime.DEAD_LETTER_DIR, (name) => name.endsWith('.json'));
+  const oldestDeadLetter = deadLetterFiles[0]
+    ? fileStats(path.join(runtime.DEAD_LETTER_DIR, deadLetterFiles[0]))
+    : null;
   const stateFiles = safeList(runtime.STATE_DIR, (name) => name.endsWith('.json'));
   const cacheFiles = safeList(runtime.GIT_CACHE_DIR, (name) => name.endsWith('.json'));
   const newestCache = newestFile(runtime.GIT_CACHE_DIR, cacheFiles);
@@ -90,6 +94,13 @@ function buildStatus(runtime) {
       pending: queueFiles.length,
       oldestQueuedAt: oldest ? oldest.mtime.toISOString() : null,
     },
+    deadLetter: {
+      dir: runtime.DEAD_LETTER_DIR || null,
+      unsent: deadLetterFiles.length,
+      oldestDeadLetteredAt: oldestDeadLetter ? oldestDeadLetter.mtime.toISOString() : null,
+    },
+    // Everything captured that the backend has not accepted yet.
+    unsent: queueFiles.length + deadLetterFiles.length,
     state: {
       dir: runtime.STATE_DIR,
       activeStreams: stateFiles.length,
@@ -120,6 +131,12 @@ function printStatus(runtime, label) {
     `DevClocked ${label} Hook Status`,
     `auth: ${status.auth.apiKeyPresent ? 'configured' : 'missing'} (${status.auth.configPath})`,
     `queue: ${status.queue.pending} pending${status.queue.oldestQueuedAt ? `, oldest ${status.queue.oldestQueuedAt}` : ''}`,
+    // Dead-lettered envelopes are captured activity the backend has not taken
+    // yet — worth calling out, because a number that never falls means the
+    // replay is not reaching the backend (DEV-936).
+    status.deadLetter.unsent > 0
+      ? `dead-letter: ! ${status.deadLetter.unsent} unsent, replays on reconnect${status.deadLetter.oldestDeadLetteredAt ? `, oldest ${status.deadLetter.oldestDeadLetteredAt}` : ''} (${status.deadLetter.dir})`
+      : 'dead-letter: 0 unsent',
     `streams: ${status.state.activeStreams} active state file(s)`,
     `git cache: ${status.cache.entries} entry(s)${status.cache.newestUpdatedAt ? `, newest ${status.cache.newestUpdatedAt}` : ''}`,
     `shipper lock: ${status.shipperLock.present ? 'present' : 'not present'}`,
@@ -141,5 +158,6 @@ function printStatus(runtime, label) {
 }
 
 module.exports = {
+  buildStatus,
   printStatus,
 };

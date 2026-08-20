@@ -8,6 +8,19 @@ const path = require('node:path');
 // Redirect HOME before requiring so tests never touch real plugin state.
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'devclocked-claude-ship-test-'));
 
+const runtime = require('./runtime');
+
+// ship.js destructures callEdgeFunction out of ./runtime at require time, so
+// the stub has to be installed on the exports object BEFORE ship.js is
+// required. Nothing in this file may reach the network.
+const edgeCalls = [];
+let edgeUp = false;
+runtime.callEdgeFunction = async (apiKey, fnName, body) => {
+  edgeCalls.push({ apiKey, fnName, body });
+  if (!edgeUp) throw new Error('edge_function_503');
+  return { status: 200, body: JSON.stringify({ processed_count: 1, session_updated: true }) };
+};
+
 const {
   DELAYED_ENVELOPE_MS,
   STALE_SESSION_END_MS,
@@ -17,7 +30,7 @@ const {
   isStaleSessionEnd,
   processEnvelope,
 } = require('./ship');
-const runtime = require('./runtime');
+const { drainQueue } = require('../runtime/ship');
 
 test('only SessionStart/SessionEnd are lifecycle events (Stop is per-turn)', () => {
   assert.equal(isLifecycleEvent('SessionStart'), true);
@@ -161,4 +174,138 @@ test('a non-lifecycle envelope 5 minutes old logs "Shipping delayed hook event" 
   );
   assert.equal(drop?.extra.reason, 'throttled');
   assert.equal(fs.existsSync(filePath), false);
+});
+
+// --- DEV-936: retry exhaustion dead-letters instead of destroying activity ----
+// Design ported from tracker-core DEV-826. Before this, ~75s of backend
+// downtime (5 attempts) unlinked the envelope and the activity was gone.
+
+const { MAX_SHIP_ATTEMPTS } = runtime;
+
+function purgeQueues() {
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+  for (const filePath of runtime.listDeadLetterFiles()) fs.unlinkSync(filePath);
+}
+
+// Retries are gated by a 15s backoff stamp; clear it so a whole exhaustion
+// cycle fits in one test.
+async function exhaustRetries(filePath) {
+  for (let attempt = 0; attempt < MAX_SHIP_ATTEMPTS; attempt += 1) {
+    const envelope = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    delete envelope.retry_after;
+    fs.writeFileSync(filePath, JSON.stringify(envelope));
+    await processEnvelope(filePath, 'test-api-key');
+  }
+}
+
+test('an envelope whose retries are exhausted is dead-lettered, not deleted (DEV-936)', async () => {
+  purgeQueues();
+  edgeUp = false;
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'PostToolUse',
+    session_id: 'sess-936-exhaust',
+    tool_name: 'Bash',
+  });
+  const name = path.basename(filePath);
+
+  await exhaustRetries(filePath);
+
+  const parked = path.join(runtime.DEAD_LETTER_DIR, name);
+  assert.equal(fs.existsSync(filePath), false, 'the envelope must leave the live queue');
+  assert.equal(fs.existsSync(parked), true, 'the envelope must survive in the dead-letter store');
+
+  const envelope = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  assert.ok(envelope.dead_lettered_at, 'dead_lettered_at must be stamped');
+  assert.match(envelope.dead_letter_reason, /^max_attempts:/);
+  assert.equal(envelope.attempts, MAX_SHIP_ATTEMPTS);
+  // Parked envelopes stay invisible to the live drain until a replay.
+  assert.deepEqual(runtime.listQueueFiles(), []);
+
+  purgeQueues();
+});
+
+test('a dead-lettered envelope replays and ships EXACTLY ONCE when the backend recovers (DEV-936)', async () => {
+  purgeQueues();
+  edgeUp = false;
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'PostToolUse',
+    session_id: 'sess-936-replay',
+    tool_name: 'Bash',
+  });
+  const name = path.basename(filePath);
+  await exhaustRetries(filePath);
+  assert.equal(fs.existsSync(path.join(runtime.DEAD_LETTER_DIR, name)), true);
+
+  edgeUp = true;
+  edgeCalls.length = 0;
+  const result = await drainQueue(runtime, processEnvelope, { apiKey: 'test-api-key' });
+
+  assert.equal(result.replayed, 1);
+  assert.equal(result.shipped, 1);
+  assert.equal(edgeCalls.length, 1, 'a replayed envelope must reach track-tick exactly once');
+  assert.equal(edgeCalls[0].fnName, 'track-tick');
+  assert.equal(fs.existsSync(path.join(runtime.DEAD_LETTER_DIR, name)), false);
+  assert.equal(fs.existsSync(path.join(runtime.QUEUE_DIR, name)), false);
+
+  purgeQueues();
+});
+
+test('a replay against a still-unreachable backend makes one pass and keeps the envelope (DEV-936)', async () => {
+  purgeQueues();
+  edgeUp = false;
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'PostToolUse',
+    session_id: 'sess-936-still-down',
+    tool_name: 'Bash',
+  });
+  const name = path.basename(filePath);
+  await exhaustRetries(filePath);
+
+  edgeCalls.length = 0;
+  const result = await drainQueue(runtime, processEnvelope, { apiKey: 'test-api-key' });
+
+  assert.equal(result.replayed, 1);
+  assert.equal(result.shipped, 0);
+  assert.equal(edgeCalls.length, 1, 'one attempt per replayed envelope, then the run ends');
+
+  // Nothing lost: back in the live queue with one spent attempt, on its way to
+  // the dead-letter store again through the normal retry path.
+  const requeued = path.join(runtime.QUEUE_DIR, name);
+  assert.equal(fs.existsSync(requeued), true);
+  const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
+  assert.equal(envelope.attempts, 1);
+  assert.ok(envelope.retry_after);
+
+  purgeQueues();
+});
+
+test('a replayed dead-letter SessionEnd is still discarded as stale — lifecycle events are time-sensitive, ticks are not (DEV-936/DEV-938)', async () => {
+  purgeQueues();
+  edgeUp = true;
+  edgeCalls.length = 0;
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'SessionEnd',
+    session_id: 'sess-936-stale-replay',
+  });
+  const name = path.basename(filePath);
+  backdateEnvelope(filePath, 25 * 60_000);
+  runtime.deadLetterEnvelope(
+    filePath,
+    JSON.parse(fs.readFileSync(filePath, 'utf-8')),
+    'max_attempts:edge_function_503'
+  );
+
+  const result = await drainQueue(runtime, processEnvelope, { apiKey: 'test-api-key' });
+
+  assert.equal(result.replayed, 1);
+  assert.equal(result.shipped, 0);
+  assert.equal(edgeCalls.length, 0, 'the backend already closed this session by idle timeout');
+  assert.equal(fs.existsSync(path.join(runtime.QUEUE_DIR, name)), false);
+  assert.equal(fs.existsSync(path.join(runtime.DEAD_LETTER_DIR, name)), false);
+  const drop = readShipperLogEntries().find(
+    (entry) => entry.message === 'Dropping queued hook event' && entry.extra?.file === name
+  );
+  assert.equal(drop?.extra.reason, 'stale_session_end');
+
+  purgeQueues();
 });
