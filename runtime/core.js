@@ -67,17 +67,19 @@ function safeId(value) {
 function writeJsonFile(filePath, value) {
   ensureDir(path.dirname(filePath));
   const tmpPath = `${filePath}.${process.pid}.tmp`;
-  // 0600: queue envelopes and state can carry file paths and identifiers —
-  // owner read/write only (DEV-715).
-  fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), { mode: 0o600 });
   try {
-    fs.chmodSync(tmpPath, 0o600);
-  } catch {
-    // best-effort — non-POSIX platforms have no meaningful mode.
-  }
-  try {
+    // 0600: queue envelopes and state can carry file paths and identifiers —
+    // owner read/write only (DEV-715).
+    fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), { mode: 0o600 });
+    try {
+      fs.chmodSync(tmpPath, 0o600);
+    } catch {
+      // best-effort — non-POSIX platforms have no meaningful mode.
+    }
     fs.renameSync(tmpPath, filePath);
   } catch (error) {
+    // The write itself has to be inside the try: an ENOSPC/EIO part-way
+    // through leaves a temp file that nothing else will ever clean up.
     try {
       fs.unlinkSync(tmpPath);
     } catch {
@@ -796,12 +798,53 @@ function createPluginRuntime(options) {
     return target;
   }
 
-  // Bound the dead-letter store by age and by total bytes, oldest first. This
-  // is the only place queued activity is truly lost, so every eviction is
-  // logged — silent loss here would be the exact bug DEV-936 fixes.
+  // Delete files in dirPath whose mtime is past maxAgeMs. Used for the two side
+  // stores that hold nothing shippable: .tmp orphans left by a write that died
+  // before its rename, and quarantined envelopes that will never parse. mtime is
+  // the right clock for both — neither has a trustworthy captured_at.
+  function sweepStaleFiles(dirPath, { now, maxAgeMs, filter, reason }) {
+    let names;
+    try {
+      names = fs.readdirSync(dirPath);
+    } catch {
+      return 0;
+    }
+    let removed = 0;
+    for (const name of names) {
+      if (!filter(name)) continue;
+      const filePath = path.join(dirPath, name);
+      let stats;
+      try {
+        stats = fs.statSync(filePath);
+      } catch {
+        continue;
+      }
+      if (now - stats.mtimeMs <= maxAgeMs) continue;
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        continue;
+      }
+      removed += 1;
+      appendLog('shipper', 'Swept stale file', { file: name, dir: dirPath, reason });
+    }
+    return removed;
+  }
+
+  // The once-per-run housekeeping sweep. Bounds the dead-letter store by age and
+  // by total bytes, oldest first, and clears the two side stores that would
+  // otherwise grow without limit. Dead-letter eviction is the only path that
+  // truly loses activity, so every eviction is logged — silent loss here would
+  // be the exact bug DEV-936 fixes. The return value counts dead-letter
+  // evictions only; the side sweeps log their own.
   function pruneDeadLetter(now = Date.now(), options = {}) {
     const maxAgeMs = options.maxAgeMs ?? DEAD_LETTER_MAX_AGE_MS;
     const maxBytes = options.maxBytes ?? DEAD_LETTER_MAX_BYTES;
+
+    const isTmp = (name) => name.endsWith('.tmp');
+    sweepStaleFiles(QUEUE_DIR, { now, maxAgeMs, filter: isTmp, reason: 'orphaned_tmp' });
+    sweepStaleFiles(DEAD_LETTER_DIR, { now, maxAgeMs, filter: isTmp, reason: 'orphaned_tmp' });
+    sweepStaleFiles(QUARANTINE_DIR, { now, maxAgeMs, filter: () => true, reason: 'quarantine_max_age' });
 
     const entries = [];
     for (const filePath of listDeadLetterFiles()) {
@@ -864,15 +907,16 @@ function createPluginRuntime(options) {
   // budget. Deliberately single-envelope: the caller ships each one before
   // moving the next, so a backend that is still unreachable costs exactly one
   // timeout instead of one per parked envelope, and everything not yet moved
-  // stays parked. Returns the new queue path, or null when the move failed.
+  // stays parked. Returns { queuedPath, quarantined }: queuedPath is null when
+  // the envelope did not move, and quarantined says whether that was because it
+  // would not parse (so the caller can account for it).
   function replayDeadLetterFile(filePath) {
     let envelope;
     try {
       envelope = readJsonFile(filePath);
     } catch (error) {
       // Unparsable and unshippable: quarantine rather than replay it forever.
-      quarantineEnvelope(filePath, error);
-      return null;
+      return { queuedPath: null, quarantined: quarantineEnvelope(filePath, error) };
     }
     envelope.attempts = 0;
     delete envelope.retry_after;
@@ -886,16 +930,16 @@ function createPluginRuntime(options) {
         file: path.basename(filePath),
         error: error instanceof Error ? error.message : 'unknown_error',
       });
-      return null;
+      return { queuedPath: null, quarantined: false };
     }
-    return target;
+    return { queuedPath: target, quarantined: false };
   }
 
   // Batch form, oldest first, for callers that do not need to stop early.
   function replayDeadLetter(limit = DEAD_LETTER_REPLAY_LIMIT) {
     let replayed = 0;
     for (const filePath of listDeadLetterFiles().slice(0, limit)) {
-      if (replayDeadLetterFile(filePath)) replayed += 1;
+      if (replayDeadLetterFile(filePath).queuedPath) replayed += 1;
     }
     if (replayed > 0) {
       appendLog('shipper', 'Replayed dead-lettered hook events into the queue', { count: replayed });

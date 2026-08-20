@@ -156,6 +156,14 @@ function classifyActivity(hookEvent, input, stream) {
 // the hook's own capture instant, then the enqueue instant, and only then the
 // wall clock. A tick replayed six days later is recorded when it happened
 // rather than at reconnect time.
+//
+// Precedence is hook-time-first and stays that way (DEV-936 R3). Claude Code's
+// hook input carries no timestamp field of its own — unlike Codex, which has
+// one and keeps it ahead of captured_at. The nearest equivalent here is
+// devclocked_capture.captured_at, stamped inside the hook process by track.js,
+// which is strictly earlier and more accurate than the envelope's captured_at
+// (stamped a moment later at enqueue). Both are frozen in the envelope, so
+// either way the value is replay-stable.
 function tickInstant(input, envelope) {
   const captured = input?.devclocked_capture?.captured_at;
   if (typeof captured === 'string' && Number.isFinite(Date.parse(captured))) return captured;

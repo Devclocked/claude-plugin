@@ -111,7 +111,7 @@ test('acquireShipperLockWithWait returns null once the timeout is spent waiting'
 // The fake above has no dead-letter helpers, so drainQueue skips replay
 // entirely. This one models the store as a second in-memory set and moves one
 // envelope at a time, exactly like the real runtime.
-function fakeRuntimeWithDeadLetter(queue, deadLetter) {
+function fakeRuntimeWithDeadLetter(queue, deadLetter, corruptDeadLetter = new Set()) {
   const calls = { prune: 0, replayed: [], quarantined: [] };
   return {
     calls,
@@ -125,9 +125,13 @@ function fakeRuntimeWithDeadLetter(queue, deadLetter) {
     listDeadLetterFiles: () => [...deadLetter].sort(),
     replayDeadLetterFile: (filePath) => {
       deadLetter.delete(filePath);
+      if (corruptDeadLetter.has(filePath)) {
+        calls.quarantined.push(filePath);
+        return { queuedPath: null, quarantined: true };
+      }
       queue.add(filePath);
       calls.replayed.push(filePath);
-      return filePath;
+      return { queuedPath: filePath, quarantined: false };
     },
     quarantineEnvelope: (filePath) => {
       queue.delete(filePath);
@@ -299,4 +303,20 @@ test('drainQueue honours replay: false for callers that only want the live queue
   assert.equal(result.replayed, 0);
   assert.equal(runtime.calls.prune, 0);
   assert.equal(deadLetter.size, 1);
+});
+
+test('a dead-letter entry quarantined during replay is counted, not silently swallowed (DEV-936 R4)', async () => {
+  const queue = new Set();
+  const deadLetter = new Set(['/q/dead-corrupt.json', '/q/dead-good.json']);
+  const runtime = fakeRuntimeWithDeadLetter(queue, deadLetter, new Set(['/q/dead-corrupt.json']));
+
+  const result = await drainQueue(runtime, async (filePath) => {
+    queue.delete(filePath);
+    return SHIPPED;
+  });
+
+  assert.equal(result.quarantined, 1, 'quarantines from the replay path must reach the caller');
+  assert.deepEqual(runtime.calls.quarantined, ['/q/dead-corrupt.json']);
+  assert.equal(result.replayed, 1, 'the good entry still replays past the corrupt one');
+  assert.equal(result.shipped, 1);
 });

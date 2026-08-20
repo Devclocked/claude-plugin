@@ -495,8 +495,9 @@ test('replayDeadLetterFile returns one envelope to the queue with a clean retry 
   spent.retry_after = new Date(Date.now() + 15_000).toISOString();
   fs.writeFileSync(parked, JSON.stringify(spent));
 
-  const requeued = runtime.replayDeadLetterFile(parked);
+  const { queuedPath: requeued, quarantined } = runtime.replayDeadLetterFile(parked);
 
+  assert.equal(quarantined, false);
   assert.equal(requeued, path.join(runtime.QUEUE_DIR, 'replay-one.json'));
   assert.equal(fs.existsSync(parked), false);
   const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
@@ -550,7 +551,7 @@ test('a dead-lettered envelope that will not parse is quarantined rather than re
   const parked = path.join(runtime.DEAD_LETTER_DIR, 'corrupt-parked.json');
   fs.writeFileSync(parked, '{"captured_at":');
 
-  assert.equal(runtime.replayDeadLetterFile(parked), null);
+  assert.deepEqual(runtime.replayDeadLetterFile(parked), { queuedPath: null, quarantined: true });
   assert.equal(fs.existsSync(parked), false);
   assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, 'corrupt-parked.json')), true);
 
@@ -589,4 +590,82 @@ test('a queue file that parses fine is left in place when processing fails for a
   assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, path.basename(filePath))), false);
 
   fs.unlinkSync(filePath);
+});
+
+test('the once-per-run sweep clears quarantined files past the age cap (DEV-936 R1)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.QUARANTINE_DIR);
+
+  const aged = path.join(runtime.QUARANTINE_DIR, 'aged.json');
+  const fresh = path.join(runtime.QUARANTINE_DIR, 'fresh.json');
+  fs.writeFileSync(aged, '{"broken');
+  fs.writeFileSync(fresh, '{"broken');
+  const eightDaysAgo = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(aged, eightDaysAgo, eightDaysAgo);
+
+  runtime.pruneDeadLetter();
+
+  assert.equal(fs.existsSync(aged), false, 'the quarantine store must not grow forever');
+  assert.equal(fs.existsSync(fresh), true, 'a recent one stays around to be diagnosed');
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+});
+
+test('the once-per-run sweep clears orphaned .tmp files past the age cap (DEV-936 R2)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  runtime.ensureDir(runtime.DEAD_LETTER_DIR);
+
+  // A write that died between writeFileSync and renameSync.
+  const orphans = [
+    path.join(runtime.QUEUE_DIR, '123-4-abc.json.99.tmp'),
+    path.join(runtime.DEAD_LETTER_DIR, '123-4-def.json.99.tmp'),
+  ];
+  const fresh = path.join(runtime.DEAD_LETTER_DIR, '123-4-ghi.json.99.tmp');
+  for (const filePath of [...orphans, fresh]) fs.writeFileSync(filePath, 'x'.repeat(1000));
+  const eightDaysAgo = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  for (const filePath of orphans) fs.utimesSync(filePath, eightDaysAgo, eightDaysAgo);
+
+  runtime.pruneDeadLetter();
+
+  for (const filePath of orphans) assert.equal(fs.existsSync(filePath), false);
+  assert.equal(fs.existsSync(fresh), true, 'a fresh temp file may belong to a live write');
+  // Either way a .tmp is invisible to both globs, so it can never be shipped.
+  assert.deepEqual(runtime.listQueueFiles(), []);
+  assert.deepEqual(runtime.listDeadLetterFiles(), []);
+
+  fs.unlinkSync(fresh);
+});
+
+test('a failed write leaves no temp file behind (DEV-936 R2)', () => {
+  const runtime = makeRuntime(() => '');
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  const target = path.join(runtime.QUEUE_DIR, 'blocked.json');
+  const tmpPath = `${target}.${process.pid}.tmp`;
+
+  // Model an ENOSPC that lands part-way through: the temp file exists on disk
+  // by the time the write throws. That is the orphan nothing else would ever
+  // clean up — and an orphan in the dead-letter dir is invisible to the 5 MB
+  // ceiling. Only a write that is itself inside the try can unlink it.
+  const realWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = (filePath, ...rest) => {
+    realWriteFileSync(filePath, ...rest);
+    if (filePath === tmpPath) throw new Error('ENOSPC: no space left on device');
+    return undefined;
+  };
+
+  try {
+    assert.throws(() => runtime.writeJsonFile(target, { id: 'x' }), /ENOSPC/);
+  } finally {
+    fs.writeFileSync = realWriteFileSync;
+  }
+
+  assert.equal(fs.existsSync(target), false, 'a failed write must not publish');
+  assert.equal(fs.existsSync(tmpPath), false, 'no orphan may survive a failed write');
+  assert.deepEqual(
+    fs.readdirSync(runtime.QUEUE_DIR).filter((name) => name.endsWith('.tmp')),
+    []
+  );
 });

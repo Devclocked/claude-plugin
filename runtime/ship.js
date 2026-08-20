@@ -113,7 +113,8 @@ async function drainQueue(runtime, processEnvelope, {
 
     if (canReplay) {
       for (const parkedPath of runtime.listDeadLetterFiles().slice(0, replayLimit)) {
-        const queuedPath = runtime.replayDeadLetterFile(parkedPath);
+        const { queuedPath, quarantined } = runtime.replayDeadLetterFile(parkedPath);
+        if (quarantined) state.quarantined += 1;
         if (!queuedPath) continue;
         state.replayed += 1;
         const result = await attempt(queuedPath);

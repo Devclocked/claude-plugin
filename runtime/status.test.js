@@ -78,3 +78,21 @@ test('status counts pending and dead-lettered envelopes separately, and flags de
 
   clearAll();
 });
+
+test('status counts quarantined files and flags them when non-zero (DEV-936 R1)', () => {
+  clearAll();
+  runtime.ensureDir(runtime.QUARANTINE_DIR);
+  fs.writeFileSync(path.join(runtime.QUARANTINE_DIR, 'truncated.json'), '{"id":"half-writ');
+
+  const status = buildStatus(runtime);
+  assert.equal(status.quarantine.count, 1);
+  assert.equal(status.quarantine.dir, runtime.QUARANTINE_DIR);
+  assert.ok(status.quarantine.oldestAt);
+  assert.equal(status.unsent, 0, 'an unreadable file is not unsent activity');
+
+  const printed = captureStatus('Test');
+  assert.match(printed, /quarantine: ! 1 unreadable file\(s\)/);
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+  assert.match(captureStatus('Test'), /quarantine: 0 files/);
+});

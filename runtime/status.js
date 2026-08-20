@@ -51,6 +51,12 @@ function buildStatus(runtime) {
   const oldestDeadLetter = deadLetterFiles[0]
     ? fileStats(path.join(runtime.DEAD_LETTER_DIR, deadLetterFiles[0]))
     : null;
+  // No extension filter: a quarantined file is whatever name it had in the
+  // queue, and the point is to count everything sitting in there.
+  const quarantineFiles = safeList(runtime.QUARANTINE_DIR);
+  const oldestQuarantine = quarantineFiles[0]
+    ? fileStats(path.join(runtime.QUARANTINE_DIR, quarantineFiles[0]))
+    : null;
   const stateFiles = safeList(runtime.STATE_DIR, (name) => name.endsWith('.json'));
   const cacheFiles = safeList(runtime.GIT_CACHE_DIR, (name) => name.endsWith('.json'));
   const newestCache = newestFile(runtime.GIT_CACHE_DIR, cacheFiles);
@@ -99,7 +105,13 @@ function buildStatus(runtime) {
       unsent: deadLetterFiles.length,
       oldestDeadLetteredAt: oldestDeadLetter ? oldestDeadLetter.mtime.toISOString() : null,
     },
-    // Everything captured that the backend has not accepted yet.
+    quarantine: {
+      dir: runtime.QUARANTINE_DIR || null,
+      count: quarantineFiles.length,
+      oldestAt: oldestQuarantine ? oldestQuarantine.mtime.toISOString() : null,
+    },
+    // Everything captured that the backend has not accepted yet. Quarantined
+    // files are excluded: they are unreadable, not unsent.
     unsent: queueFiles.length + deadLetterFiles.length,
     state: {
       dir: runtime.STATE_DIR,
@@ -137,6 +149,11 @@ function printStatus(runtime, label) {
     status.deadLetter.unsent > 0
       ? `dead-letter: ! ${status.deadLetter.unsent} unsent, replays on reconnect${status.deadLetter.oldestDeadLetteredAt ? `, oldest ${status.deadLetter.oldestDeadLetteredAt}` : ''} (${status.deadLetter.dir})`
       : 'dead-letter: 0 unsent',
+    // Corrupt envelopes that will never ship. Normally zero; a non-zero count
+    // that keeps climbing means something is truncating queue writes.
+    status.quarantine.count > 0
+      ? `quarantine: ! ${status.quarantine.count} unreadable file(s)${status.quarantine.oldestAt ? `, oldest ${status.quarantine.oldestAt}` : ''} (${status.quarantine.dir})`
+      : 'quarantine: 0 files',
     `streams: ${status.state.activeStreams} active state file(s)`,
     `git cache: ${status.cache.entries} entry(s)${status.cache.newestUpdatedAt ? `, newest ${status.cache.newestUpdatedAt}` : ''}`,
     `shipper lock: ${status.shipperLock.present ? 'present' : 'not present'}`,
