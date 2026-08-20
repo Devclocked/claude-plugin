@@ -52,8 +52,32 @@ function envelopeAgeMs(envelope, nowMs = Date.now()) {
   return Math.max(0, nowMs - capturedAt);
 }
 
+// Lifecycle markers older than the backend's idle authority (20 min) carry no
+// time signal. An end marker is redundant: the backend already closed the
+// session by idle timeout, so shipping it late can only anchor a phantom
+// session at its stale captured_at (DEV-938). A START marker is worse — the
+// dead-letter replay (DEV-936) can hand back a SessionStart from before an
+// outage, and initializing stream state for it would anchor a session at
+// reconnect time whose matching end marker is itself discarded as stale,
+// leaving a session that never closes.
+//
+// SubagentStart is deliberately NOT in this map, unlike the Cursor plugin's
+// subagentStart. Claude's initializeLifecycleState creates no state for it, so
+// it cannot anchor a phantom session — and it is the only event carrying
+// agent_type, so discarding a replayed one would leave the subagent stream
+// permanently unnamed (DEV-816).
+const STALE_LIFECYCLE_REASONS = {
+  SessionEnd: 'stale_session_end',
+  SessionStart: 'stale_session_start',
+};
+
+function staleLifecycleReason(hookEvent, ageMs) {
+  if (ageMs <= STALE_SESSION_END_MS) return null;
+  return STALE_LIFECYCLE_REASONS[hookEvent] || null;
+}
+
 function isStaleSessionEnd(hookEvent, ageMs) {
-  return hookEvent === 'SessionEnd' && ageMs > STALE_SESSION_END_MS;
+  return staleLifecycleReason(hookEvent, ageMs) === 'stale_session_end';
 }
 
 function initializeLifecycleState(hookEvent, stream, input) {
@@ -82,15 +106,25 @@ async function processEnvelope(filePath, apiKey) {
   }
 
   const stream = resolveStream(hookEvent, input);
-  initializeLifecycleState(hookEvent, stream, input);
 
   const ageMs = envelopeAgeMs(envelope);
-  if (isStaleSessionEnd(hookEvent, ageMs)) {
+  const staleReason = staleLifecycleReason(hookEvent, ageMs);
+  if (staleReason === 'stale_session_end') {
     // Backend already closed this session by idle timeout — see STALE_SESSION_END_MS.
     removeStreamState(stream.sessionId);
-    discardEnvelope(filePath, envelope, 'stale_session_end');
+    discardEnvelope(filePath, envelope, staleReason);
     return;
   }
+  if (staleReason) {
+    // stale_session_start: discard WITHOUT creating stream state, which is why
+    // initializeLifecycleState now runs below this check and not above it. On
+    // Claude that also keeps rememberSessionModel from minting a state file for
+    // a session the backend has already closed.
+    discardEnvelope(filePath, envelope, staleReason);
+    return;
+  }
+
+  initializeLifecycleState(hookEvent, stream, input);
   if (ageMs > DELAYED_ENVELOPE_MS) {
     appendLog('shipper', 'Shipping delayed hook event', {
       file: path.basename(filePath),
@@ -111,7 +145,7 @@ async function processEnvelope(filePath, apiKey) {
 
   const gitContext = resolveGitContext(input);
   const repo = resolveRepo(input, stream, gitContext);
-  const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext);
+  const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
 
   try {
     const response = await callEdgeFunction(apiKey, 'track-tick', payload);
@@ -121,7 +155,9 @@ async function processEnvelope(filePath, apiKey) {
         file: path.basename(filePath),
         hook_event_name: hookEvent,
       });
-      return;
+      // A 2xx that processed nothing still proves the backend is up, which is
+      // all the dead-letter replay needs to unlock (DEV-936).
+      return { shipped: false, reachable: true };
     }
 
     if (!isLifecycleEvent(hookEvent)) {
@@ -148,9 +184,7 @@ async function processEnvelope(filePath, apiKey) {
     }
 
     fs.unlinkSync(filePath);
-    // Truthy tells drainQueue the backend is reachable, which is what unlocks
-    // the one dead-letter replay pass for this shipper run (DEV-936).
-    return true;
+    return { shipped: true, reachable: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown_error';
     if ((envelope.attempts || 0) + 1 >= MAX_SHIP_ATTEMPTS) {
@@ -162,7 +196,7 @@ async function processEnvelope(filePath, apiKey) {
       envelope.last_error = message;
       envelope.last_attempt_at = new Date().toISOString();
       deadLetterEnvelope(filePath, envelope, `max_attempts:${message}`);
-      return;
+      return { shipped: false, reachable: false, failed: true };
     }
     markEnvelopeRetry(filePath, envelope, message);
     appendLog('shipper', 'Queued hook event failed to send', {
@@ -171,6 +205,9 @@ async function processEnvelope(filePath, apiKey) {
       attempts: (envelope.attempts || 0) + 1,
       error: message,
     });
+    // failed: the send itself did not land, so a dead-letter replay drain stops
+    // here instead of paying a timeout for every remaining parked envelope.
+    return { shipped: false, reachable: false, failed: true };
   }
 }
 
@@ -186,4 +223,5 @@ module.exports = {
   isLifecycleEvent,
   isStaleSessionEnd,
   processEnvelope,
+  staleLifecycleReason,
 };

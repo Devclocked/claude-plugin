@@ -148,9 +148,24 @@ function classifyActivity(hookEvent, input, stream) {
   }
 }
 
-function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
-  const capture = input.devclocked_capture || {};
-  const now = typeof capture.captured_at === 'string' ? capture.captured_at : new Date().toISOString();
+// Ship-time values used to leak into every tick. The dead-letter replay
+// (DEV-936) makes re-sending a queued envelope routine, and the backend dedupes
+// a tick on SHA-256(source|timestamp|entity|entity_type) — so if `timestamp`
+// moved with the shipper's clock, the same envelope replayed would hash to a
+// new tick_key and be counted twice. It is now a pure function of the envelope:
+// the hook's own capture instant, then the enqueue instant, and only then the
+// wall clock. A tick replayed six days later is recorded when it happened
+// rather than at reconnect time.
+function tickInstant(input, envelope) {
+  const captured = input?.devclocked_capture?.captured_at;
+  if (typeof captured === 'string' && Number.isFinite(Date.parse(captured))) return captured;
+  const enqueued = Date.parse(envelope?.captured_at);
+  if (Number.isFinite(enqueued)) return new Date(enqueued).toISOString();
+  return new Date().toISOString();
+}
+
+function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope) {
+  const now = tickInstant(input, envelope);
   const toolName = normalizedToolName(input);
 
   let entity = `claude://session/${stream.sessionId}`;
@@ -259,6 +274,7 @@ module.exports = {
   inferModelProvider,
   normalizedToolName,
   rememberSessionModel,
+  tickInstant,
   resolveExecutionContext,
   resolveModel,
   resolveRepo,

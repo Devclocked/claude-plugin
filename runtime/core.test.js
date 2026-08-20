@@ -486,3 +486,107 @@ test('replayDeadLetter returns envelopes to the queue with a clean retry budget 
   fs.unlinkSync(requeued);
   clearDeadLetter(runtime);
 });
+
+test('replayDeadLetterFile returns one envelope to the queue with a clean retry budget (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const parked = writeDeadLetterEntry(runtime, 'replay-one.json', 60_000);
+  const spent = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  spent.retry_after = new Date(Date.now() + 15_000).toISOString();
+  fs.writeFileSync(parked, JSON.stringify(spent));
+
+  const requeued = runtime.replayDeadLetterFile(parked);
+
+  assert.equal(requeued, path.join(runtime.QUEUE_DIR, 'replay-one.json'));
+  assert.equal(fs.existsSync(parked), false);
+  const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
+  assert.equal(envelope.attempts, 0, 'attempts must reset');
+  assert.equal(envelope.retry_after, undefined, 'the backoff must be cleared');
+  assert.equal(runtime.shouldRetryEnvelope(envelope), true);
+
+  fs.unlinkSync(requeued);
+  clearDeadLetter(runtime);
+});
+
+test('replayDeadLetter moves at most the replay limit, oldest first (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  for (let i = 0; i < 30; i += 1) {
+    writeDeadLetterEntry(runtime, `bulk-${String(i).padStart(3, '0')}.json`, (30 - i) * 60_000);
+  }
+
+  assert.equal(runtime.DEAD_LETTER_REPLAY_LIMIT, 25);
+  assert.equal(runtime.replayDeadLetter(), 25);
+  assert.equal(runtime.listDeadLetterFiles().length, 5, 'the rest wait for the next run');
+
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+  clearDeadLetter(runtime);
+});
+
+test('an unreadable queue file is quarantined out of both globs instead of wedging the drain (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const corrupt = path.join(runtime.QUEUE_DIR, 'truncated.json');
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  fs.writeFileSync(corrupt, '{"id":"half-writ');
+  assert.throws(() => runtime.readJsonFile(corrupt));
+
+  assert.equal(runtime.quarantineEnvelope(corrupt, new SyntaxError('Unexpected end of JSON input')), true);
+
+  assert.equal(fs.existsSync(corrupt), false);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, 'truncated.json')), true);
+  assert.deepEqual(runtime.listQueueFiles(), [], 'a corrupt file must not be re-listed');
+  assert.deepEqual(runtime.listDeadLetterFiles(), [], 'and it is not replayable either');
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+});
+
+test('a dead-lettered envelope that will not parse is quarantined rather than replayed forever (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.DEAD_LETTER_DIR);
+  const parked = path.join(runtime.DEAD_LETTER_DIR, 'corrupt-parked.json');
+  fs.writeFileSync(parked, '{"captured_at":');
+
+  assert.equal(runtime.replayDeadLetterFile(parked), null);
+  assert.equal(fs.existsSync(parked), false);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, 'corrupt-parked.json')), true);
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+  clearDeadLetter(runtime);
+});
+
+test('writeJsonFile publishes by rename, so a reader never sees a partial envelope (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const filePath = runtime.enqueueHookEvent({ hook_event_name: 'PostToolUse', session_id: 'sess-atomic' });
+
+  // Every intermediate write lands on a .tmp name that neither glob matches,
+  // and nothing is left behind once the rename completes.
+  const residue = fs.readdirSync(runtime.QUEUE_DIR).filter((name) => name.endsWith('.tmp'));
+  assert.deepEqual(residue, []);
+  assert.doesNotThrow(() => runtime.readJsonFile(filePath));
+
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(filePath).mode & 0o777, 0o600, 'the rename must preserve 0600');
+  }
+
+  fs.unlinkSync(filePath);
+});
+
+test('a queue file that parses fine is left in place when processing fails for another reason (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const filePath = runtime.enqueueHookEvent({ hook_event_name: 'PostToolUse', session_id: 'sess-transient' });
+
+  // A transient write failure must not relocate captured activity.
+  assert.equal(runtime.quarantineEnvelope(filePath, new Error('EROFS: read-only file system')), false);
+  assert.equal(fs.existsSync(filePath), true);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, path.basename(filePath))), false);
+
+  fs.unlinkSync(filePath);
+});

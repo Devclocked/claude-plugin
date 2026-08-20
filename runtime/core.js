@@ -21,6 +21,11 @@ const RETRY_BACKOFF_MS = 15_000;
 // with no client-side dedupe. Eviction below is the only path that loses data.
 const DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEAD_LETTER_MAX_BYTES = 5 * 1024 * 1024;
+// At 5 MB the store holds ~19.5k envelopes. Replaying them all in one run would
+// hold the shipper lock far past LOCK_STALE_MS (60s), at which point another
+// shipper reclaims the lock from a LIVE holder and the two ship concurrently.
+// Cap the batch and drain it oldest-first over successive runs instead.
+const DEAD_LETTER_REPLAY_LIMIT = 25;
 const PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1000;
 const MAX_PLUGIN_ACTIVITY_ENTRIES = 1000;
 const STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -54,15 +59,31 @@ function safeId(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+// Write via a temp file + rename so a reader never sees a half-written
+// envelope. A plain writeFileSync left truncated JSON behind whenever the
+// process died mid-write, and one unparsable file used to wedge the whole
+// shipper (DEV-936). The temp name does not end in .json, so neither
+// listQueueFiles nor listDeadLetterFiles can pick it up.
 function writeJsonFile(filePath, value) {
   ensureDir(path.dirname(filePath));
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
   // 0600: queue envelopes and state can carry file paths and identifiers —
   // owner read/write only (DEV-715).
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), { mode: 0o600 });
   try {
-    fs.chmodSync(filePath, 0o600);
+    fs.chmodSync(tmpPath, 0o600);
   } catch {
     // best-effort — non-POSIX platforms have no meaningful mode.
+  }
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore
+    }
+    throw error;
   }
 }
 
@@ -222,6 +243,10 @@ function createPluginRuntime(options) {
   // in QUEUE_DIR, so a dead-letter entry parked there would be picked straight
   // back up by the next drain instead of waiting for a replay.
   const DEAD_LETTER_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-dead-letter`);
+  // Envelopes that cannot be parsed at all. Kept out of both the queue and the
+  // dead-letter globs: a corrupt file cannot be shipped and cannot be replayed,
+  // so parking it here is what stops it wedging every later envelope (DEV-936).
+  const QUARANTINE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-corrupt`);
   const SHIPPER_LOCK_PATH = path.join(QUEUE_DIR, 'shipper.lock');
   const PLUGIN_ACTIVITY_PATH = path.join(PLUGIN_ACTIVITY_DIR, `${source}.json`);
 
@@ -764,7 +789,10 @@ function createPluginRuntime(options) {
       hook_event_name: envelope.input?.hook_event_name || null,
       attempts: envelope.attempts || 0,
     });
-    pruneDeadLetter();
+    // Deliberately NOT pruning here. Pruning stats and reads every entry, and
+    // an outage dead-letters envelopes in bursts — doing it per move burned
+    // ~52s of the 60s lock window on a 100-envelope burst. drainQueue prunes
+    // once per run instead (DEV-936).
     return target;
   }
 
@@ -832,37 +860,88 @@ function createPluginRuntime(options) {
     return evicted;
   }
 
-  // Move every dead-lettered envelope back into the live queue with a clean
-  // retry budget. Callers run this at most once per shipper pass so a still
-  // unreachable backend cannot spin the shipper; envelopes that fail again
-  // retry and re-dead-letter through the normal path.
-  function replayDeadLetter() {
+  // Move ONE dead-lettered envelope back into the live queue with a clean retry
+  // budget. Deliberately single-envelope: the caller ships each one before
+  // moving the next, so a backend that is still unreachable costs exactly one
+  // timeout instead of one per parked envelope, and everything not yet moved
+  // stays parked. Returns the new queue path, or null when the move failed.
+  function replayDeadLetterFile(filePath) {
+    let envelope;
+    try {
+      envelope = readJsonFile(filePath);
+    } catch (error) {
+      // Unparsable and unshippable: quarantine rather than replay it forever.
+      quarantineEnvelope(filePath, error);
+      return null;
+    }
+    envelope.attempts = 0;
+    delete envelope.retry_after;
+    envelope.replayed_at = new Date().toISOString();
+    const target = path.join(QUEUE_DIR, path.basename(filePath));
+    try {
+      writeJsonFile(target, envelope);
+      fs.unlinkSync(filePath);
+    } catch (error) {
+      appendLog('shipper', 'Failed to replay dead-lettered hook event', {
+        file: path.basename(filePath),
+        error: error instanceof Error ? error.message : 'unknown_error',
+      });
+      return null;
+    }
+    return target;
+  }
+
+  // Batch form, oldest first, for callers that do not need to stop early.
+  function replayDeadLetter(limit = DEAD_LETTER_REPLAY_LIMIT) {
     let replayed = 0;
-    for (const filePath of listDeadLetterFiles()) {
-      let envelope;
-      try {
-        envelope = readJsonFile(filePath);
-      } catch {
-        continue;
-      }
-      envelope.attempts = 0;
-      delete envelope.retry_after;
-      envelope.replayed_at = new Date().toISOString();
-      try {
-        writeJsonFile(path.join(QUEUE_DIR, path.basename(filePath)), envelope);
-        fs.unlinkSync(filePath);
-        replayed += 1;
-      } catch (error) {
-        appendLog('shipper', 'Failed to replay dead-lettered hook event', {
-          file: path.basename(filePath),
-          error: error instanceof Error ? error.message : 'unknown_error',
-        });
-      }
+    for (const filePath of listDeadLetterFiles().slice(0, limit)) {
+      if (replayDeadLetterFile(filePath)) replayed += 1;
     }
     if (replayed > 0) {
       appendLog('shipper', 'Replayed dead-lettered hook events into the queue', { count: replayed });
     }
     return replayed;
+  }
+
+  // A queue file that will not parse cannot ship and cannot replay. Move it out
+  // of the way — leaving it in place threw out of processEnvelope, unwound the
+  // whole drain and stranded every other envelope behind it (DEV-936).
+  //
+  // ONLY unparsable files are moved. Any other throw (a transient write failure
+  // while stamping a retry, say) leaves a perfectly good envelope alone for the
+  // next run rather than quietly relocating captured activity.
+  function quarantineEnvelope(filePath, error) {
+    if (!fs.existsSync(filePath)) return false;
+    try {
+      readJsonFile(filePath);
+      appendLog('shipper', 'Queue file failed to process but still parses — left in place', {
+        file: path.basename(filePath),
+        error: error instanceof Error ? error.message : 'unknown_error',
+      });
+      return false;
+    } catch {
+      // Genuinely unreadable — fall through and move it.
+    }
+
+    const target = path.join(QUARANTINE_DIR, path.basename(filePath));
+    let moved = false;
+    try {
+      ensureDir(QUARANTINE_DIR);
+      fs.renameSync(filePath, target);
+      moved = true;
+    } catch {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Leave it; the next run catches the same throw and retries the move.
+      }
+    }
+    appendLog('shipper', 'Quarantined unreadable queue file', {
+      file: path.basename(filePath),
+      moved_to: moved ? target : null,
+      error: error instanceof Error ? error.message : 'unknown_error',
+    });
+    return moved;
   }
 
   function wakeShipper() {
@@ -945,11 +1024,13 @@ function createPluginRuntime(options) {
     LOG_DIR,
     GIT_CACHE_DIR,
     DEAD_LETTER_DIR,
+    QUARANTINE_DIR,
     SHIPPER_LOCK_PATH,
     SHIPPER_PATH: shipperPath,
     MAX_SHIP_ATTEMPTS,
     DEAD_LETTER_MAX_AGE_MS,
     DEAD_LETTER_MAX_BYTES,
+    DEAD_LETTER_REPLAY_LIMIT,
     appendLog,
     acquireShipperLock,
     callEdgeFunction,
@@ -968,11 +1049,13 @@ function createPluginRuntime(options) {
     normalizeOpaqueId,
     pruneDeadLetter,
     pruneStaleStreamState,
+    quarantineEnvelope,
     readJsonFile,
     recordPluginActivity,
     releaseShipperLock,
     removeStreamState,
     replayDeadLetter,
+    replayDeadLetterFile,
     resolveGitContext,
     saveStreamState,
     shouldRetryEnvelope,
@@ -987,5 +1070,6 @@ module.exports = {
   MAX_SHIP_ATTEMPTS,
   DEAD_LETTER_MAX_AGE_MS,
   DEAD_LETTER_MAX_BYTES,
+  DEAD_LETTER_REPLAY_LIMIT,
   createPluginRuntime,
 };

@@ -320,3 +320,104 @@ test('isTrackTickProcessed rejects accepted but unprocessed responses', () => {
     body: JSON.stringify({ processed_count: 1, session_updated: false }),
   }), true);
 });
+
+// --- DEV-936 F1: the payload must be a pure function of the queued envelope ---
+// Envelopes queue RAW hook input, so the payload is assembled at SHIP time. The
+// backend dedupes a tick on SHA-256(source|timestamp|entity|entity_type) and
+// upserts on (user_id, tick_key), so `timestamp` moving with the shipper's
+// clock is exactly what would make a dead-letter replay count twice. Unlike the
+// Cursor plugin there is no request_key to lean on: this plugin deliberately
+// ships neither run_id nor request_key (they would split the daemon's stream),
+// so tick_key is the whole idempotency story and timestamp is the only part of
+// it that was ever ship-derived.
+
+const IDEMPOTENCY_ENVELOPE = {
+  id: '0f8c4a1e-1111-4222-8333-444455556666',
+  captured_at: '2026-08-14T07:00:00.000Z',
+};
+
+function buildTwice(hookEvent, input, stream, envelope) {
+  const repo = { repo_name: 'widget', branch: 'main' };
+  const gitContext = { repoUrl: null, repoFullName: null, workspaceFingerprint: null, workspacePath: null };
+  const first = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
+  const second = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
+  return [first.ticks[0], second.ticks[0]];
+}
+
+test('the same envelope built twice yields an identical tick identity (DEV-936)', () => {
+  const input = { session_id: 'sess-936-idem', tool_name: 'Edit', tool_input: { file_path: '/tmp/project/src/app.ts' } };
+  const stream = primaryStream('sess-936-idem');
+
+  const [first] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  // Rebuild after wall-clock time has moved on, which is exactly what a replay
+  // hours or days later does.
+  const before = Date.now;
+  Date.now = () => before() + 90_000;
+  let second;
+  try {
+    [, second] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  } finally {
+    Date.now = before;
+  }
+
+  // These four are precisely the tick_key preimage.
+  assert.equal(first.timestamp, second.timestamp, 'timestamp must not move with ship time');
+  assert.equal(first.entity, second.entity);
+  assert.equal(first.entity_type, second.entity_type);
+  assert.equal(
+    first.activity_context.ai_tool.timestamp,
+    second.activity_context.ai_tool.timestamp
+  );
+});
+
+test('the tick is stamped at capture time, not at reconnect time (DEV-936)', () => {
+  const input = {
+    session_id: 'sess-936-idem',
+    tool_name: 'Edit',
+    tool_input: { file_path: '/tmp/project/src/app.ts' },
+    devclocked_capture: { captured_at: '2026-08-14T07:00:00.000Z', remote: false, bridge_session_id: null },
+  };
+  const stream = primaryStream('sess-936-idem');
+
+  const [tick] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+
+  // A six-day-old replayed tick must be recorded when it happened.
+  assert.equal(tick.timestamp, '2026-08-14T07:00:00.000Z');
+  assert.equal(tick.activity_context.ai_tool.timestamp, '2026-08-14T07:00:00.000Z');
+});
+
+test('an envelope carries the capture instant when the hook input lost it (DEV-936)', () => {
+  // A replayed envelope whose input predates devclocked_capture still has to be
+  // stamped from the queue, never from the shipper's clock.
+  const input = { session_id: 'sess-936-no-capture', tool_name: 'Bash' };
+  const stream = primaryStream('sess-936-no-capture');
+
+  const [tick] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+
+  assert.equal(tick.timestamp, IDEMPOTENCY_ENVELOPE.captured_at);
+});
+
+test('the hook capture instant wins over the enqueue instant (DEV-936)', () => {
+  // devclocked_capture is stamped inside the hook process; captured_at is
+  // stamped a moment later at enqueue. The earlier, more precise one wins.
+  const input = {
+    session_id: 'sess-936-precedence',
+    tool_name: 'Bash',
+    devclocked_capture: { captured_at: '2026-08-14T07:00:00.000Z' },
+  };
+  const stream = primaryStream('sess-936-precedence');
+
+  const [tick] = buildTwice('PostToolUse', input, stream, { id: 'x', captured_at: '2026-08-14T09:99:99.999Z' });
+
+  assert.equal(tick.timestamp, '2026-08-14T07:00:00.000Z');
+});
+
+test('an envelope-less build still works and falls back to ship time (DEV-936)', () => {
+  const input = { session_id: 'sess-936-idem', tool_name: 'Bash' };
+  const stream = primaryStream('sess-936-idem');
+
+  const [tick] = buildTwice('PostToolUse', input, stream, undefined);
+
+  // The legacy 5-arg call must not throw.
+  assert.ok(Number.isFinite(Date.parse(tick.timestamp)));
+});

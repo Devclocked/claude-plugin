@@ -24,58 +24,114 @@ async function acquireShipperLockWithWait(runtime, { timeoutMs = 5000, intervalM
   }
 }
 
+// processEnvelope reports back as { shipped, reachable, failed }:
+//   shipped   — the backend accepted it and the envelope is gone
+//   reachable — the backend answered 2xx, even if it processed nothing
+//   failed    — the send threw (network error, timeout, non-2xx)
+// A plain boolean still works and means "shipped, therefore reachable".
+// Reachability is tracked separately from shipping because a run of nothing but
+// no-op ticks proves the backend is up just as well as a real tick does
+// (DEV-936).
+function normalizeResult(value) {
+  if (value && typeof value === 'object') {
+    const shipped = Boolean(value.shipped);
+    return {
+      shipped,
+      reachable: value.reachable === undefined ? shipped : Boolean(value.reachable),
+      failed: Boolean(value.failed),
+    };
+  }
+  const shipped = Boolean(value);
+  return { shipped, reachable: shipped, failed: false };
+}
+
 // Ship every queued envelope, re-listing the queue after each pass so envelopes
 // enqueued mid-pass (by hooks whose own shipper deferred to us) are picked up.
 // Stops when the re-list is empty, when it contains nothing we have not already
 // attempted in this run (a file that refuses to be removed must not spin the
 // loop), or at maxPasses.
 //
-// DEV-936: once the live queue is drained, the run makes at most ONE dead-letter
-// replay pass — when something shipped (the backend is demonstrably reachable)
-// or when the live queue was empty to begin with (an idle run doubles as a
-// reconnect probe). Replayed envelopes drain in the same run; a backend that is
-// still down fails them once and the run ends, so it cannot spin the shipper.
-//
-// processEnvelope resolves truthy when the envelope actually shipped; every
-// other outcome (retry, discard, dead-letter) resolves falsy.
-async function drainQueue(runtime, processEnvelope, { maxPasses = 25, apiKey = runtime.loadAuth(), replay = true } = {}) {
+// DEV-936: once the live queue is drained, the run makes ONE bounded
+// dead-letter replay pass — at most replayLimit envelopes, moved back one at a
+// time and shipped before the next one moves, stopping at the first send
+// failure. The first replayed envelope doubles as the reconnect probe on an
+// idle run, so a black-holed backend costs one timeout for the whole run
+// instead of one per parked envelope.
+async function drainQueue(runtime, processEnvelope, {
+  maxPasses = 25,
+  apiKey = runtime.loadAuth(),
+  replay = true,
+  replayLimit = 25,
+} = {}) {
   const attempted = new Set();
-  let passes = 0;
-  let shipped = 0;
-  let replayed = 0;
-  let replayDone = false;
-  let files = runtime.listQueueFiles();
+  const state = { passes: 0, shipped: 0, replayed: 0, quarantined: 0, reachable: false };
 
-  for (;;) {
-    while (files.length > 0 && passes < maxPasses) {
-      passes += 1;
-      for (const filePath of files) {
-        attempted.add(filePath);
-        if (await processEnvelope(filePath, apiKey)) shipped += 1;
+  // Resolves to the normalized result, or null when the envelope could not be
+  // read at all. One unparsable file used to throw all the way out of the drain
+  // and strand every envelope behind it, dead-letter replay included.
+  async function attempt(filePath) {
+    attempted.add(filePath);
+    let result;
+    try {
+      result = normalizeResult(await processEnvelope(filePath, apiKey));
+    } catch (error) {
+      // quarantineEnvelope only moves files that genuinely will not parse, so a
+      // transient failure leaves the envelope queued for the next run.
+      if (typeof runtime.quarantineEnvelope === 'function' && runtime.quarantineEnvelope(filePath, error)) {
+        state.quarantined += 1;
       }
-      files = runtime.listQueueFiles().filter((filePath) => !attempted.has(filePath));
+      runtime.appendLog('shipper', 'Queued hook event could not be processed', {
+        error: error instanceof Error ? error.message : 'unknown_error',
+      });
+      return null;
     }
+    if (result.shipped) state.shipped += 1;
+    if (result.reachable) state.reachable = true;
+    return result;
+  }
 
-    if (replayDone || !replay || passes >= maxPasses) break;
-    if (typeof runtime.replayDeadLetter !== 'function') break;
-    // Set before replaying, not after: one pass per run whatever happens next.
-    replayDone = true;
-
-    // Prune first so entries past the age/byte ceiling are evicted rather than
-    // replayed.
-    if (typeof runtime.pruneDeadLetter === 'function') runtime.pruneDeadLetter();
-
-    // Nothing shipped and the queue was not empty: the backend is still
-    // unreachable, so replaying now would only burn the replayed items' first
-    // attempt for nothing.
-    if (shipped === 0 && attempted.size > 0) break;
-
-    replayed = runtime.replayDeadLetter();
-    if (replayed === 0) break;
+  let files = runtime.listQueueFiles();
+  while (files.length > 0 && state.passes < maxPasses) {
+    state.passes += 1;
+    for (const filePath of files) {
+      await attempt(filePath);
+    }
     files = runtime.listQueueFiles().filter((filePath) => !attempted.has(filePath));
   }
 
-  return { passes, attempted: attempted.size, shipped, replayed };
+  if (replay) {
+    // Prune before replaying — and unconditionally, so the age and byte
+    // ceilings hold even on runs that never reach the backend.
+    if (typeof runtime.pruneDeadLetter === 'function') runtime.pruneDeadLetter();
+
+    const canReplay =
+      typeof runtime.replayDeadLetterFile === 'function' &&
+      typeof runtime.listDeadLetterFiles === 'function' &&
+      // Either the backend answered this run, or there was nothing live to ask
+      // with and the first replayed envelope becomes the probe.
+      (state.reachable || attempted.size === 0);
+
+    if (canReplay) {
+      for (const parkedPath of runtime.listDeadLetterFiles().slice(0, replayLimit)) {
+        const queuedPath = runtime.replayDeadLetterFile(parkedPath);
+        if (!queuedPath) continue;
+        state.replayed += 1;
+        const result = await attempt(queuedPath);
+        // Still unreachable: leave every remaining envelope parked rather than
+        // paying a timeout for each one inside the shipper lock window.
+        if (result && result.failed) break;
+      }
+    }
+  }
+
+  return {
+    passes: state.passes,
+    attempted: attempted.size,
+    shipped: state.shipped,
+    replayed: state.replayed,
+    quarantined: state.quarantined,
+    reachable: state.reachable,
+  };
 }
 
 async function runShipper(runtime, processEnvelope) {
@@ -95,10 +151,12 @@ async function runShipper(runtime, processEnvelope) {
     }
 
     const result = await drainQueue(runtime, processEnvelope, { apiKey });
-    if (result.replayed > 0) {
-      runtime.appendLog('shipper', 'Dead-letter replay pass completed', {
+    if (result.replayed > 0 || result.quarantined > 0) {
+      runtime.appendLog('shipper', 'Shipper run finished', {
         replayed: result.replayed,
+        quarantined: result.quarantined,
         shipped: result.shipped,
+        reachable: result.reachable,
       });
     }
 
@@ -122,5 +180,6 @@ async function runShipper(runtime, processEnvelope) {
 module.exports = {
   acquireShipperLockWithWait,
   drainQueue,
+  normalizeResult,
   runShipper,
 };
