@@ -98,6 +98,8 @@ npm run doctor -- --json
 ```
 
 Queue: `~/.config/devclocked/claude-hook-queue/`
+Dead letter: `~/.config/devclocked/claude-hook-dead-letter/` (ticks that ran out
+of retries; replayed automatically once the backend is reachable again)
 Logs: `~/.config/devclocked/claude-hook-logs/`
 
 ## Tests
