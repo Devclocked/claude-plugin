@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const MANAGED_PREFIX = 'DEVCLOCKED_CLAUDE_PLUGIN=1';
 const HOOK_EVENTS = [
@@ -14,8 +15,22 @@ const HOOK_EVENTS = [
   'SubagentStop',
 ];
 
+// Windows sets USERPROFILE, not HOME, so `process.env.HOME` fell through to the
+// literal '~' fallback and the installer wrote settings.json into a directory
+// named "~" beside the CWD instead of ~/.claude (DEV-1001). os.homedir() reads
+// $HOME on POSIX — so tests that sandbox by overriding process.env.HOME still
+// work — and %USERPROFILE% on Windows.
+function resolveHomeDir() {
+  try {
+    const home = os.homedir();
+    return typeof home === 'string' ? home : '';
+  } catch {
+    return '';
+  }
+}
+
 function settingsPath() {
-  return path.join(process.env.HOME || '~', '.claude', 'settings.json');
+  return path.join(resolveHomeDir() || '~', '.claude', 'settings.json');
 }
 
 function shellQuote(value) {
