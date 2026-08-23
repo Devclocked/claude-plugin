@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const https = require('https');
 const { execSync } = require('child_process');
 const { createHash, randomUUID } = require('crypto');
@@ -30,8 +31,23 @@ const PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1000;
 const MAX_PLUGIN_ACTIVITY_ENTRIES = 1000;
 const STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 
+// Windows sets USERPROFILE, not HOME, so `process.env.HOME` fell through to the
+// literal '~' fallback: every queue/state/log/cache path landed in a directory
+// named "~" beside the CWD and the CLI config was never found (DEV-1001).
+// os.homedir() reads $HOME on POSIX — so tests that sandbox by overriding
+// process.env.HOME still work — and %USERPROFILE% on Windows, with an OS-level
+// lookup when neither is set.
+function resolveHomeDir() {
+  try {
+    const home = os.homedir();
+    return typeof home === 'string' ? home : '';
+  } catch {
+    return '';
+  }
+}
+
 function devclockedHome() {
-  return path.join(process.env.HOME || '~', '.config', 'devclocked');
+  return path.join(resolveHomeDir() || '~', '.config', 'devclocked');
 }
 
 function readPluginVersion(shipperPath) {
@@ -335,7 +351,7 @@ function createPluginRuntime(options) {
     if (!maybePath || typeof maybePath !== 'string') return null;
     const candidate = path.isAbsolute(maybePath)
       ? maybePath
-      : path.join(process.env.HOME || '/', maybePath);
+      : path.join(resolveHomeDir() || '/', maybePath);
     try {
       const stat = fs.statSync(candidate);
       if (stat.isDirectory()) return candidate;
@@ -483,7 +499,7 @@ function createPluginRuntime(options) {
       // fall through with the raw path
     }
     const normalized = resolved.replace(/\/+$/, '') || '/';
-    let home = process.env.HOME || '';
+    let home = resolveHomeDir();
     try {
       if (home) home = fs.realpathSync(home);
     } catch {
