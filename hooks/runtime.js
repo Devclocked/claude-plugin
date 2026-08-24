@@ -2,6 +2,7 @@
 
 const path = require('path');
 const { createPluginRuntime } = require('../runtime/core');
+const shellThreadNames = require('../runtime/shellThreadNames');
 
 const runtime = createPluginRuntime({
   namespace: 'claude-hook',
@@ -172,9 +173,43 @@ function tickInstant(input, envelope) {
   return new Date().toISOString();
 }
 
+// A shell-run session (t3 code, Demuxx) never gets an ai-title, so the only
+// name it has lives in the shell's sqlite store on this host. On a remote
+// environment these hooks are the only DevClocked code present, so the name
+// goes out on the tick and the backend labels the stream everywhere (DEV-1055).
+// Cached on the stream state: one read-only sqlite open per session per TTL,
+// negative answers included, so an unnamed session does not hit the store on
+// every tool call.
+const SHELL_TITLE_TTL_MS = 60_000;
+let shellTitleResolver = (sessionId) => shellThreadNames.lookupClaudeSession(sessionId);
+
+function shellTitleFor(stream) {
+  // Subagents are named by their registry type + task already (DEV-816).
+  if (stream.isSubagent || stream.sessionId === 'unknown') return null;
+  if (!shellThreadNames.shellTitlesEnabled()) return null;
+
+  const state = runtime.getStreamState(stream.sessionId) || {};
+  const cached = state.shell_title;
+  const nowMs = Date.now();
+  if (cached && typeof cached.checked_at === 'number' && nowMs - cached.checked_at < SHELL_TITLE_TTL_MS) {
+    return cached.title ? { title: cached.title, source: cached.source } : null;
+  }
+
+  let hit = null;
+  try {
+    hit = shellTitleResolver(stream.sessionId) || null;
+  } catch {
+    hit = null;
+  }
+  state.shell_title = { title: hit?.title || null, source: hit?.source || null, checked_at: nowMs };
+  runtime.saveStreamState(stream.sessionId, state);
+  return hit;
+}
+
 function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope) {
   const now = tickInstant(input, envelope);
   const toolName = normalizedToolName(input);
+  const shellTitle = shellTitleFor(stream);
 
   let entity = `claude://session/${stream.sessionId}`;
   let entityType = 'window';
@@ -244,6 +279,11 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envel
         // Registry type name ('Explore', 'general-purpose') — only SubagentStart
         // carries it, and one tick is enough for the stream to be named (DEV-816).
         agent_type: stream.agentType || undefined,
+        // The shell's name for this session, with where it came from. Absent
+        // for sessions the agent named itself (the daemon ships those) and for
+        // every session when titles are switched off (DEV-1055).
+        stream_title: shellTitle ? shellTitle.title : undefined,
+        stream_title_source: shellTitle ? shellTitle.source : undefined,
         is_sidechain: stream.isSubagent,
         stream_id: streamId,
         parent_stream_id: stream.isSubagent ? rootStreamId : undefined,
@@ -275,9 +315,16 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envel
   return request;
 }
 
+/** Test seam: swap the sqlite lookup for a stub. */
+function setShellTitleResolver(resolver) {
+  shellTitleResolver = resolver;
+}
+
 module.exports = {
   ...runtime,
   buildTrackTickRequest,
+  setShellTitleResolver,
+  shellTitleFor,
   classifyActivity,
   inferModelProvider,
   normalizedToolName,

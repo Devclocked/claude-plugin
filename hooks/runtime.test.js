@@ -421,3 +421,69 @@ test('an envelope-less build still works and falls back to ship time (DEV-936)',
   // The legacy 5-arg call must not throw.
   assert.ok(Number.isFinite(Date.parse(tick.timestamp)));
 });
+
+// DEV-1055: shell (t3 code / Demuxx) titles ride the tick with their source.
+const runtimeModule = require('./runtime');
+const NAMED_SHELL = { title: 'Stream Name in App', source: 'demuxx' };
+
+test('buildTrackTickRequest carries the shell title and its source for a shell-run session', () => {
+  runtimeModule.setShellTitleResolver((sessionId) => (sessionId === 'sess-shell' ? NAMED_SHELL : null));
+  try {
+    const named = buildTrackTickRequest(
+      'PostToolUse',
+      { session_id: 'sess-shell', tool_name: 'Read', tool_input: { file_path: '/tmp/a.ts' } },
+      primaryStream('sess-shell'),
+      REPO,
+      NO_GIT
+    );
+    const aiTool = named.ticks[0].activity_context.ai_tool;
+    assert.equal(aiTool.stream_title, 'Stream Name in App');
+    assert.equal(aiTool.stream_title_source, 'demuxx');
+
+    const unnamed = buildTrackTickRequest(
+      'PostToolUse',
+      { session_id: 'sess-plain', tool_name: 'Read' },
+      primaryStream('sess-plain'),
+      REPO,
+      NO_GIT
+    );
+    assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title, undefined);
+    assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title_source, undefined);
+
+    // Subagents keep their registry-type naming (DEV-816); the shell name belongs to the parent.
+    const subInput = { session_id: 'sess-shell', agent_id: 'agent-1', agent_type: 'Explore' };
+    const sub = buildTrackTickRequest('SubagentStart', subInput, resolveStream('SubagentStart', subInput), REPO, NO_GIT);
+    assert.equal(sub.ticks[0].activity_context.ai_tool.stream_title, undefined);
+    assert.equal(sub.ticks[0].activity_context.ai_tool.agent_type, 'Explore');
+  } finally {
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
+
+test('shell title lookups are cached on the stream state, negative answers included', () => {
+  let calls = 0;
+  runtimeModule.setShellTitleResolver(() => {
+    calls += 1;
+    return null;
+  });
+  try {
+    const stream = primaryStream('sess-cache');
+    runtimeModule.shellTitleFor(stream);
+    runtimeModule.shellTitleFor(stream);
+    runtimeModule.shellTitleFor(stream);
+    assert.equal(calls, 1);
+  } finally {
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
+
+test('shell titles stay on the host when DEVCLOCKED_TRACK_SESSION_TITLES=0', () => {
+  process.env.DEVCLOCKED_TRACK_SESSION_TITLES = '0';
+  runtimeModule.setShellTitleResolver(() => NAMED_SHELL);
+  try {
+    assert.equal(runtimeModule.shellTitleFor(primaryStream('sess-off')), null);
+  } finally {
+    delete process.env.DEVCLOCKED_TRACK_SESSION_TITLES;
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
