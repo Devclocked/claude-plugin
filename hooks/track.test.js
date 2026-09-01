@@ -44,7 +44,7 @@ test('track.js enqueues each supported hook event from stdin', () => {
     { hook_event_name: 'SessionStart', session_id: 's1', source: 'startup', model: 'claude-opus-4-6' },
     { hook_event_name: 'UserPromptSubmit', session_id: 's1' },
     { hook_event_name: 'PostToolUse', session_id: 's1', tool_name: 'Edit', tool_input: { file_path: '/tmp/a.ts' } },
-    { hook_event_name: 'Stop', session_id: 's1' },
+    { hook_event_name: 'Stop', session_id: 's1', transcript_path: 'relative/private-transcript.jsonl', prompt: 'planted private prompt' },
     { hook_event_name: 'SubagentStart', session_id: 's1', agent_id: 'a1', agent_type: 'Explore' },
     { hook_event_name: 'SubagentStop', session_id: 's1', agent_id: 'a1' },
     { hook_event_name: 'SessionEnd', session_id: 's1' },
@@ -66,6 +66,8 @@ test('track.js enqueues each supported hook event from stdin', () => {
     assert.equal(input.devclocked_capture.remote, false);
     assert.equal(input.devclocked_capture.bridge_session_id, null);
     assert.ok(input.devclocked_capture.captured_at);
+    assert.equal(Object.hasOwn(input, 'transcript_path'), false);
+    assert.equal(Object.hasOwn(input, 'prompt'), false);
   }
 });
 

@@ -19,6 +19,8 @@ activity accordingly.
   session's working directory
 - Local queue + detached background shipper for reliable, non-blocking
   event delivery
+- Targeted agent-run sync after `Stop` and `SessionEnd` when Claude supplies an
+  absolute transcript path
 
 ## Setup
 
@@ -63,10 +65,16 @@ Per hook event, one tick is shipped to DevClocked with:
   the session is driven via Remote Control (control surface is reported
   as `unknown` in that case — phone vs browser cannot be distinguished)
 
-Runtime and token measurement is intentionally NOT shipped by this
-plugin: the DevClocked desktop daemon owns precise token/runtime
-measurement from Claude Code transcripts. The plugin also never sets a
-`run_id`, so its stream merges with the daemon's
+The live hook queue does not ship runtime or token measurements. On `Stop` and
+`SessionEnd`, the plugin starts
+`npx -y @devclocked/cli@latest agent-runs sync` as a detached process when the
+hook provides an absolute transcript path. The CLI resolves and validates the
+path under `~/.claude/projects` before reading it. The plugin does not keep the
+path in its queue or logs. The CLI reads the transcript locally and sends only
+agent-run metadata. It does not send prompts, responses, commands, or file
+contents.
+
+The plugin also never sets a `run_id`, so its stream merges with the daemon's
 `claude-code:<sessionId>[:agentId]` stream instead of double-counting.
 
 ## Coverage model
