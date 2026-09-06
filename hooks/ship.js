@@ -1417,6 +1417,10 @@ var require_runtime = __commonJS({
         repository_full_name: gitContext.repoFullName || void 0,
         repos: gitContext.repoFullName ? { full_name: gitContext.repoFullName } : void 0,
         activity_context: {
+          // A submitted prompt is the one hook that proves a human is at the keyboard;
+          // ingest counts it as human time only when this flag is set (DEV-1258).
+          // Boolean only: prompt text never leaves the machine.
+          ...hookEvent === "UserPromptSubmit" ? { human_presence: true } : {},
           ai_tool: {
             tool: "claude-code",
             activity_type: activity.activity_type,
@@ -1510,6 +1514,9 @@ var {
 function isLifecycleEvent(hookEvent) {
   return ["SessionStart", "SessionEnd"].includes(hookEvent);
 }
+function bypassesThrottle(hookEvent) {
+  return isLifecycleEvent(hookEvent) || hookEvent === "UserPromptSubmit";
+}
 function isActivityTypeTransition(priorState, newActivityType) {
   return Boolean(priorState?.last_activity_type) && priorState.last_activity_type !== newActivityType;
 }
@@ -1574,7 +1581,7 @@ async function processEnvelope(filePath, apiKey) {
     });
   }
   const throttleStateId = stream.throttleId;
-  if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
+  if (!bypassesThrottle(hookEvent) && shouldThrottle(throttleStateId)) {
     const priorState = getStreamState(throttleStateId);
     const newActivity = classifyActivity(hookEvent, input, stream);
     if (!isActivityTypeTransition(priorState, newActivity.activity_type)) {
@@ -1642,6 +1649,7 @@ module.exports = {
   DELAYED_ENVELOPE_MS,
   STALE_SESSION_END_MS,
   envelopeAgeMs,
+  bypassesThrottle,
   isActivityTypeTransition,
   isLifecycleEvent,
   isStaleSessionEnd,
