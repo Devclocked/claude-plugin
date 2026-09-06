@@ -511,7 +511,9 @@ var require_core = __commonJS({
         };
       }
       function buildRepoGitContext(gitRoot) {
-        const repoUrl = sanitizeRepoUrl(gitExec(gitRoot, "git remote get-url origin"));
+        const remoteResult = gitExecClassified(gitRoot, "git remote get-url origin");
+        const remoteProbeDegraded = !remoteResult.ok && remoteResult.failure !== "git_error";
+        const repoUrl = sanitizeRepoUrl(remoteResult.ok ? remoteResult.stdout : null);
         const repoFullName = parseRepoFullName(repoUrl);
         const branch = gitExec(gitRoot, "git rev-parse --abbrev-ref HEAD");
         const repoName = repoFullName ? repoFullName.split("/").pop() : path2.basename(gitRoot);
@@ -524,7 +526,8 @@ var require_core = __commonJS({
           gitRoot,
           workspacePath: gitRoot,
           resolution: "git",
-          resolutionFailure: null
+          resolutionFailure: null,
+          ...remoteProbeDegraded ? { remoteProbeDegraded: true } : {}
         };
       }
       function isGuardedRoot(dirPath) {
@@ -566,7 +569,7 @@ var require_core = __commonJS({
         const rootResult = gitExecClassified(identityDir, "git rev-parse --show-toplevel");
         if (rootResult.ok) {
           const gitContext2 = buildRepoGitContext(rootResult.stdout);
-          saveCachedGitContext(identityDir, gitContext2);
+          if (!gitContext2.remoteProbeDegraded) saveCachedGitContext(identityDir, gitContext2);
           return gitContext2;
         }
         if (rootResult.failure !== "not_a_repo") {
@@ -581,7 +584,7 @@ var require_core = __commonJS({
           const fileRootResult = gitExecClassified(fileDir, "git rev-parse --show-toplevel");
           if (fileRootResult.ok) {
             const gitContext2 = buildRepoGitContext(fileRootResult.stdout);
-            saveCachedGitContext(identityDir, gitContext2);
+            if (!gitContext2.remoteProbeDegraded) saveCachedGitContext(identityDir, gitContext2);
             return gitContext2;
           }
         }

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# This file ships to the published mirror, where the plugin is a standalone
+# directory with no node_modules — the same shape a user installs. Nothing here
+# may install dependencies, or the job stops testing what users actually run.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Unit tests
+        run: npm test
+
+      - name: install.js doctor reports the track hook present
+        run: |
+          HOME=$(mktemp -d) node install.js doctor --json > doctor.json
+          cat doctor.json
+          node -e "
+            const s = require('./doctor.json');
+            if (s.trackScriptPresent !== true) {
+              throw new Error('doctor: trackScriptPresent is ' + s.trackScriptPresent);
+            }
+          "
+
+      - name: status hook runs on a clean HOME
+        run: HOME=$(mktemp -d) node hooks/status.js
+
+      - name: tree is a generated mirror
+        run: test -f GENERATED.md
