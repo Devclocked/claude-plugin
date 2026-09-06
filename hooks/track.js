@@ -1284,6 +1284,10 @@ var require_runtime = __commonJS({
         repository_full_name: gitContext.repoFullName || void 0,
         repos: gitContext.repoFullName ? { full_name: gitContext.repoFullName } : void 0,
         activity_context: {
+          // A submitted prompt is the one hook that proves a human is at the keyboard;
+          // ingest counts it as human time only when this flag is set (DEV-1258).
+          // Boolean only: prompt text never leaves the machine.
+          ...hookEvent === "UserPromptSubmit" ? { human_presence: true } : {},
           ai_tool: {
             tool: "claude-code",
             activity_type: activity.activity_type,
