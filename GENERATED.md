@@ -16,4 +16,4 @@ bytes — so only the tests that ship are wired up:
     test: node --test hooks/track.test.js install.test.js
     build: removed
 
-Built from plugin v1.1.6, plugin-runtime b57f668adf3d.
+Built from plugin v1.1.7, plugin-runtime 21964d787253.
